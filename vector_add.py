@@ -1,6 +1,8 @@
+import torch
 import triton
 import triton.language as tl
-import torch
+
+from utils import acc_check
 
 
 @triton.jit
@@ -28,19 +30,19 @@ def main():
     BLOCK_SIZE = 1024
 
     # Initialize input tensors
-    x = torch.randn(N, device="cuda", dtype=torch.float32)
-    y = torch.randn(N, device="cuda", dtype=torch.float32)
+    device = "cuda"
+    dtype = torch.float32
+    x = torch.randn(N, device=device, dtype=dtype)
+    y = torch.randn(N, device=device, dtype=dtype)
     z = torch.empty_like(x)
 
-    grid = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE']),)
-    vector_add_kernel[grid](x, y, z, N, BLOCK_SIZE)
+    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE"]),)
+    vector_add_kernel[grid](x, y, z, N, tl.constexpr(BLOCK_SIZE))
 
     # Validate correctness
     expected = x + y
-    if torch.allclose(z, expected, atol=1e-5):
-        print("Vector addition successful and correct.")
-    else:
-        print("Mismatch found in vector addition result.")
+
+    acc_check(expected, z)
 
 
 if __name__ == "__main__":
