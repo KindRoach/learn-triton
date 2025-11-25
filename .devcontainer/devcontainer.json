@@ -1,0 +1,10 @@
+{
+    "name": "learn-triton Dev Container",
+    "build": {
+        "dockerfile": "./Dockerfile"
+    },
+    "runArgs": [
+        "--runtime=nvidia",
+        "--gpus=all"
+    ]
+}
