@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from utils import acc_check
+from utils import acc_check, enable_tma_allocator
 
 
 @triton.jit
@@ -59,4 +59,5 @@ def main():
 
 
 if __name__ == "__main__":
+    enable_tma_allocator()
     main()

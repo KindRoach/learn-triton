@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from utils import acc_check
+from utils import acc_check, enable_tma_allocator
 
 
 @triton.jit
@@ -56,55 +56,62 @@ def copy_1D():
 def copy_2D_kernel(
     input_ptr: tl.pointer_type,
     output_ptr: tl.pointer_type,
-    N: int,
     M: int,
+    N: int,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
     input_desc = tl.make_tensor_descriptor(
         base=input_ptr,
-        shape=[N, M],
-        strides=[M, 1],
+        shape=[M, N],
+        strides=[N, 1],
         block_shape=[BLOCK_M, BLOCK_N],
     )
 
     output_desc = tl.make_tensor_descriptor(
         base=output_ptr,
-        shape=[N, M],
-        strides=[M, 1],
+        shape=[M, N],
+        strides=[N, 1],
         block_shape=[BLOCK_M, BLOCK_N],
     )
 
-    row_offset = pid_m * BLOCK_M
-    col_offset = pid_n * BLOCK_N
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offset_m = pid_m * BLOCK_M
+    offset_n = pid_n * BLOCK_N
 
-    x = input_desc.load([row_offset, col_offset])
-    output_desc.store([row_offset, col_offset], x)
+    x = input_desc.load([offset_m, offset_n])
+    output_desc.store([offset_m, offset_n], x)
 
 
 def copy_2D():
     print(f"{'='*20} 2D copy {'='*20}")
-    N = 65  # Example rows not divisible by BLOCK_M
-    M = 130  # Example cols not divisible by BLOCK_N
+
+    # N is ok not be multiple of 16/sizeof(dtype)
+    # Here are an example rows not divisible by BLOCK_M
+    M = 64 + 1
+
+    # triton tensor descs require stride 16 bytes alignment,
+    # so N should be multiple of 16/sizeof(dtype)
+    N = 128
+
     BLOCK_M = 16
     BLOCK_N = 32
 
-    num_blocks_m = (N + BLOCK_M - 1) // BLOCK_M
-    num_blocks_n = (M + BLOCK_N - 1) // BLOCK_N
-
     device = "cuda"
     dtype = torch.float32
-    input_tensor = torch.randn(N, M, dtype=dtype, device=device)
+    input_tensor = torch.randn(M, N, dtype=dtype, device=device)
     output_tensor = torch.empty_like(input_tensor)
 
-    copy_2D_kernel[(num_blocks_m, num_blocks_n)](
+    grid = (
+        triton.cdiv(M, BLOCK_M),
+        triton.cdiv(N, BLOCK_N),
+    )
+    copy_2D_kernel[grid](
         input_tensor,
         output_tensor,
-        N,
         M,
+        N,
         BLOCK_M,
         BLOCK_N,
     )
@@ -113,5 +120,6 @@ def copy_2D():
 
 
 if __name__ == "__main__":
+    enable_tma_allocator()
     copy_1D()
     copy_2D()
