@@ -3,6 +3,8 @@ import time
 import torch
 from typing import Optional
 
+import triton
+
 
 def bench_by_secs(
     secs: float,
@@ -52,7 +54,7 @@ def bench_by_secs(
     # Calculate and display memory bandwidth and FLOPs if provided
     if mem_access_bytes is not None:
         mem_bandwidth_bytes_per_sec = (mem_access_bytes * count) / secs
-        
+
         # Choose appropriate unit for memory bandwidth
         if mem_bandwidth_bytes_per_sec >= 1e12:
             bandwidth_str = f"{mem_bandwidth_bytes_per_sec / 1e12:.2f} TB/s"
@@ -64,7 +66,7 @@ def bench_by_secs(
             bandwidth_str = f"{mem_bandwidth_bytes_per_sec / 1e3:.2f} KB/s"
         else:
             bandwidth_str = f"{mem_bandwidth_bytes_per_sec:.2f} B/s"
-        
+
         print(f" Memory bandwidth: {bandwidth_str}")
 
     if total_flops is not None:
@@ -115,9 +117,8 @@ def is_tma_supported() -> bool:
 
 
 def enable_tma_allocator() -> None:
-    import triton
-
-    from typing import Optional
+    if not is_tma_supported():
+        return
 
     # TMA descriptors require a global memory allocation
     def alloc_fn(size: int, alignment: int, stream: Optional[int]):
