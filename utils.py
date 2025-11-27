@@ -10,27 +10,37 @@ def bench_by_secs(secs: float, func) -> None:
         return
 
     # warm-up
-    start = time.time()
+    start = time.perf_counter()
     warm_up_secs = 0.1 * secs
-    while time.time() - start < warm_up_secs:
+    while time.perf_counter() - start < warm_up_secs:
         func()
         torch.accelerator.synchronize()
 
     # benchmark
-    start = time.time()
+    start = time.perf_counter()
     count = 0
-    while time.time() - start < secs:
+    while time.perf_counter() - start < secs:
         func()
         torch.accelerator.synchronize()
         count += 1
 
-    end = time.time()
+    end = time.perf_counter()
     secs = end - start
+
+    avg_duration = secs / count
+
+    # Choose appropriate time unit based on duration
+    if avg_duration >= 1.0:
+        duration_str = f"{avg_duration:.3f} s"
+    elif avg_duration >= 0.001:
+        duration_str = f"{avg_duration * 1000:.3f} ms"
+    else:
+        duration_str = f"{avg_duration * 1_000_000:.3f} µs"
 
     print(
         f"Executed {count} iterations in {secs:.2f} seconds."
         f" Throughput: {count/secs:.2f} iters/sec."
-        f" Avg duration: {secs/count*1000:.2f} ms/iter."
+        f" Avg duration: {duration_str}/iter."
     )
 
 
@@ -51,10 +61,16 @@ def acc_check(
 
 def is_tma_supported() -> bool:
     try:
-        cuda_ok = torch.cuda.is_available()
-        sm90_ok = torch.cuda.get_device_capability()[0] >= 9
-        cuda_12_4_ok = torch.version.cuda >= "12.4"
-        return cuda_ok and sm90_ok and cuda_12_4_ok
+        if not torch.cuda.is_available():
+            return False
+
+        if torch.cuda.get_device_capability()[0] < 9:
+            return False
+            
+        if torch.version.cuda is None or torch.version.cuda < "12.4":
+            return False
+        
+        return True
     except:
         return False
 
