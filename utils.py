@@ -1,4 +1,37 @@
+import sys
+import time
 import torch
+
+
+def bench_by_secs(secs: float, func) -> None:
+    if secs <= 0:
+        print("Run func once as bench secs <= 0", file=sys.stderr)
+        func()
+        return
+
+    # warm-up
+    start = time.time()
+    warm_up_secs = 0.1 * secs
+    while time.time() - start < warm_up_secs:
+        func()
+        torch.accelerator.synchronize()
+
+    # benchmark
+    start = time.time()
+    count = 0
+    while time.time() - start < secs:
+        func()
+        torch.accelerator.synchronize()
+        count += 1
+
+    end = time.time()
+    secs = end - start
+
+    print(
+        f"Executed {count} iterations in {secs:.2f} seconds."
+        f" Throughput: {count/secs:.2f} iters/sec."
+        f" Avg duration: {secs/count*1000:.2f} ms/iter."
+    )
 
 
 def acc_check(

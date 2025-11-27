@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from utils import acc_check, enable_tma_allocator, get_device
+from utils import acc_check, bench_by_secs, enable_tma_allocator, get_device
 
 
 @triton.jit
@@ -51,13 +51,16 @@ def transpose_2D():
         triton.cdiv(N, BLOCK_N),
     )
 
-    transpose_kernel[grid](
-        input_tensor,
-        output_tensor,
-        M,
-        N,
-        BLOCK_M,
-        BLOCK_N,
+    bench_by_secs(
+        10,
+        lambda: transpose_kernel[grid](
+            input_tensor,
+            output_tensor,
+            M,
+            N,
+            BLOCK_M,
+            BLOCK_N,
+        ),
     )
 
     # Verification

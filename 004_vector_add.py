@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from utils import acc_check, enable_tma_allocator, get_device
+from utils import acc_check, bench_by_secs, enable_tma_allocator, get_device
 
 
 @triton.jit
@@ -50,7 +50,11 @@ def main():
     z = torch.empty_like(x)
 
     grid = (triton.cdiv(N, BLOCK),)
-    vector_add_kernel[grid](x, y, z, N, tl.constexpr(BLOCK))
+
+    bench_by_secs(
+        10,
+        lambda: vector_add_kernel[grid](x, y, z, N, tl.constexpr(BLOCK)),
+    )
 
     # Validate correctness
     expected = x + y

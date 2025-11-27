@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from utils import acc_check, enable_tma_allocator, get_device
+from utils import acc_check, bench_by_secs, enable_tma_allocator, get_device
 
 
 @triton.jit
@@ -41,10 +41,18 @@ def main():
     dtype = torch.float32
     x = torch.randn(N, device=device, dtype=dtype)
     y = torch.randn(N, device=device, dtype=dtype)
-    z = torch.zeros(1, device=device, dtype=dtype)
+    z = torch.empty(1, device=device, dtype=dtype)
 
     grid = (triton.cdiv(N, BLOCK),)
-    vector_dot_kernel[grid](x, y, z, N, tl.constexpr(BLOCK))
+
+    def launch_kernel():
+        z.fill_(0)
+        vector_dot_kernel[grid](x, y, z, N, tl.constexpr(BLOCK))
+
+    bench_by_secs(
+        10,
+        lambda: launch_kernel(),
+    )
 
     # Validate correctness
     expected = torch.dot(x, y).unsqueeze(0)
