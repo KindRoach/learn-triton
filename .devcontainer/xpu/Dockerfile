@@ -14,6 +14,10 @@ RUN pip install \
     torch==2.9.1 \
     --index-url https://download.pytorch.org/whl/xpu
 
+# Install other pip libs
+RUN pip install \
+    numpy
+
 # install vtune
 WORKDIR /vtune
 RUN apt-get install -y wget
@@ -22,9 +26,6 @@ RUN bash intel-vtune-2025.7.0.248_offline.sh -a -s --eula accept
 
 # setup metrics-discovery for vtune
 RUN apt-get update && apt-get install -y libdrm-dev cmake build-essential git
-
 WORKDIR /metrics-discovery
-
 RUN git clone https://github.com/intel/metrics-discovery.git .
-
 RUN cmake -S . -B build && cmake --build build -j && cmake --install build

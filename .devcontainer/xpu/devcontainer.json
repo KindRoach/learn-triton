@@ -4,6 +4,7 @@
         "dockerfile": "./Dockerfile"
     },
     "runArgs": [
-        "--device=/dev/dri"
+        "--device=/dev/dri",
+        "--privileged"
     ]
 }
