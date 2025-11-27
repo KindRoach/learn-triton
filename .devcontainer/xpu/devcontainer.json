@@ -1,0 +1,9 @@
+{
+    "name": "learn-triton Dev Container (XPU)",
+    "build": {
+        "dockerfile": "./Dockerfile"
+    },
+    "runArgs": [
+        "--device=/dev/dri"
+    ]
+}

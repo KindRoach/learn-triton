@@ -1,5 +1,5 @@
 {
-    "name": "learn-triton Dev Container",
+    "name": "learn-triton Dev Container (CUDA)",
     "build": {
         "dockerfile": "./Dockerfile"
     },
