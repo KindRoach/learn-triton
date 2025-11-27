@@ -16,7 +16,7 @@ def acc_check(
     print(f"Relative error: max = {relative_error.max().item():.3e}, mean = {relative_error.mean().item():.3e}")
 
 
-def is_tma_supported():
+def is_tma_supported() -> bool:
     try:
         cuda_ok = torch.cuda.is_available()
         sm90_ok = torch.cuda.get_device_capability()[0] >= 9
@@ -26,7 +26,7 @@ def is_tma_supported():
         return False
 
 
-def enable_tma_allocator():
+def enable_tma_allocator() -> None:
     import triton
 
     from typing import Optional
@@ -36,3 +36,13 @@ def enable_tma_allocator():
         return torch.empty(size, device="cuda", dtype=torch.float32)
 
     triton.set_allocator(alloc_fn)
+
+
+def get_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+
+    if torch.xpu.is_available():
+        return torch.device("xpu")
+
+    raise RuntimeError("No supported device found (CUDA or XPU).")

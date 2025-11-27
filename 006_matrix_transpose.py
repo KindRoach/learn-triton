@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from utils import acc_check, enable_tma_allocator
+from utils import acc_check, enable_tma_allocator, get_device
 
 
 @triton.jit
@@ -40,7 +40,7 @@ def transpose_2D():
     BLOCK_M = 64
     BLOCK_N = 64
 
-    device = "cuda"
+    device = get_device()
     dtype = torch.float32
 
     input_tensor = torch.randn((M, N), dtype=dtype, device=device)

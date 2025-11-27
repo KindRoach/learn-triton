@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from utils import acc_check, enable_tma_allocator
+from utils import acc_check, enable_tma_allocator, get_device
 
 
 @triton.jit
@@ -33,11 +33,11 @@ def copy_1D_kernel(
 
 def copy_1D():
     print(f"{'='*20} 1D copy {'='*20}")
-    N = 1024 + 1  # Example size not divisible by BLOCK
-    BLOCK = 128
+    N = (100 * 1024 * 1024) - 3
+    BLOCK = 1024
     num_blocks = (N + BLOCK - 1) // BLOCK
 
-    device = "cuda"
+    device = get_device()
     dtype = torch.float32
     input_tensor = torch.randn(N, dtype=dtype, device=device)
     output_tensor = torch.empty_like(input_tensor)
@@ -89,16 +89,16 @@ def copy_2D():
 
     # N is ok not be multiple of 16/sizeof(dtype)
     # Here are an example rows not divisible by BLOCK_M
-    M = 64 + 1
+    M = 20 * 1024 + 1
 
     # triton tensor descs require stride 16 bytes alignment,
     # so N should be multiple of 16/sizeof(dtype)
-    N = 128
+    N = 5 * 1024
 
-    BLOCK_M = 16
+    BLOCK_M = 32
     BLOCK_N = 32
 
-    device = "cuda"
+    device = get_device()
     dtype = torch.float32
     input_tensor = torch.randn(M, N, dtype=dtype, device=device)
     output_tensor = torch.empty_like(input_tensor)

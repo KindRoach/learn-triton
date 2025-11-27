@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from utils import acc_check
+from utils import acc_check, get_device
 
 
 @triton.jit
@@ -22,16 +22,16 @@ def copy_1D_kernel(
 
 def copy_1D():
     print(f"{'='*20} 1D copy {'='*20}")
-    N = 1024 + 1  # Example size not divisible by BLOCK
-    BLOCK = 128
-    num_blocks = (N + BLOCK - 1) // BLOCK
+    N = (100 * 1024 * 1024) - 3
+    BLOCK = 1024
 
-    device = "cuda"
+    device = get_device()
     dtype = torch.float32
     input_tensor = torch.randn(N, dtype=dtype, device=device)
     output_tensor = torch.empty_like(input_tensor)
 
-    copy_1D_kernel[(num_blocks,)](
+    grid = (triton.cdiv(N, BLOCK),)
+    copy_1D_kernel[grid](
         input_tensor,
         output_tensor,
         N,
@@ -66,22 +66,26 @@ def copy_2D_kernel(
     data = tl.load(input_ptr + offsets, mask=mask)
     tl.store(output_ptr + offsets, data, mask=mask)
 
+
 def copy_2D():
     print(f"{'='*20} 2D copy {'='*20}")
-    N = 65  # Example rows not divisible by BLOCK_M
-    M = 130  # Example cols not divisible by BLOCK_N
-    BLOCK_M = 16
+
+    M = 20 * 1024 + 1
+    N = 5 * 1024 - 1
+
+    BLOCK_M = 32
     BLOCK_N = 32
 
-    num_blocks_m = (N + BLOCK_M - 1) // BLOCK_M
-    num_blocks_n = (M + BLOCK_N - 1) // BLOCK_N
-
-    device = "cuda"
+    device = get_device()
     dtype = torch.float32
     input_tensor = torch.randn(N, M, dtype=dtype, device=device)
     output_tensor = torch.empty_like(input_tensor)
 
-    copy_2D_kernel[(num_blocks_m, num_blocks_n)](
+    grid = (
+        triton.cdiv(N, BLOCK_M),
+        triton.cdiv(M, BLOCK_N),
+    )
+    copy_2D_kernel[grid](
         input_tensor,
         output_tensor,
         N,
@@ -91,6 +95,7 @@ def copy_2D():
     )
 
     acc_check(input_tensor, output_tensor)
+
 
 if __name__ == "__main__":
     copy_1D()

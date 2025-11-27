@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from utils import acc_check, enable_tma_allocator
+from utils import acc_check, enable_tma_allocator, get_device
 
 
 @triton.jit
@@ -33,11 +33,11 @@ def vector_dot_kernel(
 
 
 def main():
-    N = (1 << 20) - 3  # Example size not divisible by 256
+    N = (100 * 1024 * 1024) - 3
     BLOCK = 1024
 
     # Initialize input tensors
-    device = "cuda"
+    device = get_device()
     dtype = torch.float32
     x = torch.randn(N, device=device, dtype=dtype)
     y = torch.randn(N, device=device, dtype=dtype)
