@@ -61,6 +61,7 @@ def transpose_2D():
             BLOCK_M,
             BLOCK_N,
         ),
+        mem_access_bytes=input_tensor.element_size() * input_tensor.nelement() * 2,  # 1 read + 1 write
     )
 
     # Verification

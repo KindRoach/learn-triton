@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from utils import acc_check, get_device
+from utils import acc_check, bench_by_secs, get_device
 
 
 @triton.jit
@@ -31,11 +31,16 @@ def copy_1D():
     output_tensor = torch.empty_like(input_tensor)
 
     grid = (triton.cdiv(N, BLOCK),)
-    copy_1D_kernel[grid](
-        input_tensor,
-        output_tensor,
-        N,
-        BLOCK,
+
+    bench_by_secs(
+        10,
+        lambda: copy_1D_kernel[grid](
+            input_tensor,
+            output_tensor,
+            N,
+            BLOCK,
+        ),
+        mem_access_bytes=input_tensor.element_size() * input_tensor.nelement() * 2,  # 1 read + 1 write
     )
 
     acc_check(input_tensor, output_tensor)
@@ -85,13 +90,18 @@ def copy_2D():
         triton.cdiv(N, BLOCK_M),
         triton.cdiv(M, BLOCK_N),
     )
-    copy_2D_kernel[grid](
-        input_tensor,
-        output_tensor,
-        N,
-        M,
-        BLOCK_M,
-        BLOCK_N,
+
+    bench_by_secs(
+        10,
+        lambda: copy_2D_kernel[grid](
+            input_tensor,
+            output_tensor,
+            N,
+            M,
+            BLOCK_M,
+            BLOCK_N,
+        ),
+        mem_access_bytes=input_tensor.element_size() * input_tensor.nelement() * 2,  # 1 read + 1 write
     )
 
     acc_check(input_tensor, output_tensor)

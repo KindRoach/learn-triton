@@ -52,6 +52,8 @@ def main():
     bench_by_secs(
         10,
         lambda: launch_kernel(),
+        mem_access_bytes=x.element_size() * x.nelement() * 2 + z.element_size() * z.nelement(),  # 2 reads + 1 write
+        total_flops=x.nelement() * 2,  # 1 multiplication + 1 addition per element
     )
 
     # Validate correctness

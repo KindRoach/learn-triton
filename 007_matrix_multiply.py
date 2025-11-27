@@ -82,6 +82,12 @@ def matrix_multiply():
             BLOCK_N,
             BLOCK_K,
         ),
+        mem_access_bytes=(
+            a_tensor.element_size() * a_tensor.nelement()
+            + b_tensor.element_size() * b_tensor.nelement()
+            + c_tensor.element_size() * c_tensor.nelement()
+        ),
+        total_flops=2 * M * N * K,
     )
 
     expected = torch.matmul(a_tensor, b_tensor)

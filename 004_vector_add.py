@@ -54,6 +54,8 @@ def main():
     bench_by_secs(
         10,
         lambda: vector_add_kernel[grid](x, y, z, N, tl.constexpr(BLOCK)),
+        mem_access_bytes=x.element_size() * x.nelement() * 3,  # 2 reads + 1 write
+        total_flops=x.nelement(),  # 1 addition per element
     )
 
     # Validate correctness

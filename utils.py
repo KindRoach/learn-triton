@@ -1,9 +1,15 @@
 import sys
 import time
 import torch
+from typing import Optional
 
 
-def bench_by_secs(secs: float, func) -> None:
+def bench_by_secs(
+    secs: float,
+    func,
+    mem_access_bytes: Optional[float] = None,
+    total_flops: Optional[float] = None,
+) -> None:
     if secs <= 0:
         print("Run func once as bench secs <= 0", file=sys.stderr)
         func()
@@ -40,8 +46,41 @@ def bench_by_secs(secs: float, func) -> None:
     print(
         f"Executed {count} iterations in {secs:.2f} seconds."
         f" Throughput: {count/secs:.2f} iters/sec."
-        f" Avg duration: {duration_str}/iter."
+        f" Avg duration: {duration_str}."
     )
+
+    # Calculate and display memory bandwidth and FLOPs if provided
+    if mem_access_bytes is not None:
+        mem_bandwidth_bytes_per_sec = (mem_access_bytes * count) / secs
+        
+        # Choose appropriate unit for memory bandwidth
+        if mem_bandwidth_bytes_per_sec >= 1e12:
+            bandwidth_str = f"{mem_bandwidth_bytes_per_sec / 1e12:.2f} TB/s"
+        elif mem_bandwidth_bytes_per_sec >= 1e9:
+            bandwidth_str = f"{mem_bandwidth_bytes_per_sec / 1e9:.2f} GB/s"
+        elif mem_bandwidth_bytes_per_sec >= 1e6:
+            bandwidth_str = f"{mem_bandwidth_bytes_per_sec / 1e6:.2f} MB/s"
+        elif mem_bandwidth_bytes_per_sec >= 1e3:
+            bandwidth_str = f"{mem_bandwidth_bytes_per_sec / 1e3:.2f} KB/s"
+        else:
+            bandwidth_str = f"{mem_bandwidth_bytes_per_sec:.2f} B/s"
+        
+        print(f" Memory bandwidth: {bandwidth_str}")
+
+    if total_flops is not None:
+        flops_per_sec = (total_flops * count) / secs
+
+        # Choose appropriate unit for FLOPs
+        if flops_per_sec >= 1e12:
+            flops_str = f"{flops_per_sec / 1e12:.2f} TFLOP/s"
+        elif flops_per_sec >= 1e9:
+            flops_str = f"{flops_per_sec / 1e9:.2f} GFLOP/s"
+        elif flops_per_sec >= 1e6:
+            flops_str = f"{flops_per_sec / 1e6:.2f} MFLOP/s"
+        else:
+            flops_str = f"{flops_per_sec:.2f} FLOP/s"
+
+        print(f" Compute throughput: {flops_str}")
 
 
 def acc_check(
@@ -66,10 +105,10 @@ def is_tma_supported() -> bool:
 
         if torch.cuda.get_device_capability()[0] < 9:
             return False
-            
+
         if torch.version.cuda is None or torch.version.cuda < "12.4":
             return False
-        
+
         return True
     except:
         return False

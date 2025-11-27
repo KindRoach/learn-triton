@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from utils import acc_check, enable_tma_allocator, get_device
+from utils import acc_check, bench_by_secs, enable_tma_allocator, get_device
 
 
 @triton.jit
@@ -35,18 +35,23 @@ def copy_1D():
     print(f"{'='*20} 1D copy {'='*20}")
     N = (100 * 1024 * 1024) - 3
     BLOCK = 1024
-    num_blocks = (N + BLOCK - 1) // BLOCK
 
     device = get_device()
     dtype = torch.float32
     input_tensor = torch.randn(N, dtype=dtype, device=device)
     output_tensor = torch.empty_like(input_tensor)
 
-    copy_1D_kernel[(num_blocks,)](
-        input_tensor,
-        output_tensor,
-        N,
-        BLOCK,
+    grid = (triton.cdiv(N, BLOCK),)
+
+    bench_by_secs(
+        10,
+        lambda: copy_1D_kernel[grid](
+            input_tensor,
+            output_tensor,
+            N,
+            BLOCK,
+        ),
+        mem_access_bytes=input_tensor.element_size() * input_tensor.nelement() * 2,  # 1 read + 1 write
     )
 
     acc_check(input_tensor, output_tensor)
@@ -95,8 +100,8 @@ def copy_2D():
     # so N should be multiple of 16/sizeof(dtype)
     N = 5 * 1024
 
-    BLOCK_M = 32
-    BLOCK_N = 32
+    BLOCK_M = 128
+    BLOCK_N = 128
 
     device = get_device()
     dtype = torch.float32
@@ -107,13 +112,18 @@ def copy_2D():
         triton.cdiv(M, BLOCK_M),
         triton.cdiv(N, BLOCK_N),
     )
-    copy_2D_kernel[grid](
-        input_tensor,
-        output_tensor,
-        M,
-        N,
-        BLOCK_M,
-        BLOCK_N,
+
+    bench_by_secs(
+        10,
+        lambda: copy_2D_kernel[grid](
+            input_tensor,
+            output_tensor,
+            M,
+            N,
+            BLOCK_M,
+            BLOCK_N,
+        ),
+        mem_access_bytes=input_tensor.element_size() * input_tensor.nelement() * 2,  # 1 read + 1 write
     )
 
     acc_check(input_tensor, output_tensor)
