@@ -8,7 +8,7 @@
             "name": "debug triton: Current File",
             "type": "debugpy",
             "request": "launch",
-            "program": "${file}",
+            "module": "${command:extension.commandvariable.file.relativeFileDotsNoExtension}",
             "console": "integratedTerminal",
             "justMyCode": false,
             "env": {
