@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from utils import acc_check, bench_by_secs, enable_tma_allocator, get_device
+from ..utils import acc_check, bench_by_secs, enable_tma_allocator, get_device
 
 
 @triton.jit

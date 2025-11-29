@@ -1,25 +1,15 @@
-import os
 import torch
 import triton
 import triton.language as tl
 
-from utils import get_device
-
-# Show how autotuning works, not necessarily for normal use cases
-os.environ["TRITON_CACHE_DISABLE"] = "1"
-os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
+from ..utils import get_device
 
 
-@triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_SIZE": bs},
-            num_warps=w,
-        )
-        for bs in [128, 256, 1024]
-        for w in [4, 8, 16]
-    ],
-    key=["N"],
+@triton.heuristics(
+    {
+        "BLOCK_SIZE": lambda args: 1024 if args["N"] >= 1024 * 1024 else 256,
+        "num_warps": lambda args: 2 if args["N"] >= 1024 * 1024 else 1,
+    }
 )
 @triton.jit
 def add_one_kernel(
@@ -28,6 +18,9 @@ def add_one_kernel(
     BLOCK_SIZE: tl.constexpr,
     num_warps: tl.constexpr,
 ):
+    if tl.program_id(0) == 0:
+        print(f"Using BLOCK_SIZE = {BLOCK_SIZE}")
+
     desc = tl.make_tensor_descriptor(
         base=x_ptr,
         shape=[N],
@@ -51,5 +44,5 @@ def add_one(N: int):
 
 
 if __name__ == "__main__":
-    add_one(1024)
+    add_one(1024)    
     add_one(1024 * 1024)

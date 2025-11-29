@@ -2,11 +2,11 @@ import torch
 import triton
 import triton.language as tl
 
-from utils import acc_check, bench_by_secs, enable_tma_allocator, get_device
+from ..utils import acc_check, bench_by_secs, enable_tma_allocator, get_device
 
 
 @triton.jit
-def vector_add_kernel(
+def vector_dot_kernel(
     x_ptr: tl.pointer_type,
     y_ptr: tl.pointer_type,
     out_ptr: tl.pointer_type,
@@ -25,17 +25,11 @@ def vector_add_kernel(
         strides=[1],
         block_shape=[BLOCK],
     )
-    out_desc = tl.make_tensor_descriptor(
-        base=out_ptr,
-        shape=[N],
-        strides=[1],
-        block_shape=[BLOCK],
-    )
 
     x_tile = x_desc.load([tl.program_id(0) * BLOCK])
     y_tile = y_desc.load([tl.program_id(0) * BLOCK])
-    out_tile = x_tile + y_tile
-    out_desc.store([tl.program_id(0) * BLOCK], out_tile)
+    block_sum = tl.sum(x_tile * y_tile)
+    tl.atomic_add(out_ptr, block_sum)
 
 
 def main():
@@ -47,19 +41,23 @@ def main():
     dtype = torch.float32
     x = torch.randn(N, device=device, dtype=dtype)
     y = torch.randn(N, device=device, dtype=dtype)
-    z = torch.empty_like(x)
+    z = torch.empty(1, device=device, dtype=dtype)
 
     grid = (triton.cdiv(N, BLOCK),)
 
+    def launch_kernel():
+        z.fill_(0)
+        vector_dot_kernel[grid](x, y, z, N, tl.constexpr(BLOCK))
+
     bench_by_secs(
         10,
-        lambda: vector_add_kernel[grid](x, y, z, N, tl.constexpr(BLOCK)),
-        mem_access_bytes=x.element_size() * x.nelement() * 3,  # 2 reads + 1 write
-        total_flops=x.nelement(),  # 1 addition per element
+        lambda: launch_kernel(),
+        mem_access_bytes=x.element_size() * x.nelement() * 2 + z.element_size() * z.nelement(),  # 2 reads + 1 write
+        total_flops=x.nelement() * 2,  # 1 multiplication + 1 addition per element
     )
 
     # Validate correctness
-    expected = x + y
+    expected = torch.dot(x, y).unsqueeze(0)
 
     acc_check(expected, z)
 
