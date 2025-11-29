@@ -54,9 +54,9 @@ def flash_attn_kernel(
         q_tile = q_desc.load([q_block_start, 0])
 
         # initialize tmp variables
-        o_tile = tl.zeros((BLOCK_Q, head_dim), dtype=tl.float32)
         max_score = tl.full((BLOCK_Q,), float("-inf"), dtype=tl.float32)
         exp_sum = tl.zeros((BLOCK_Q,), dtype=tl.float32)
+        o_tile = tl.zeros((BLOCK_Q, head_dim), dtype=tl.float32)
 
         # iterate over KV in blocks
         for kv_block_start in range(0, kv_len, BLOCK_KV):

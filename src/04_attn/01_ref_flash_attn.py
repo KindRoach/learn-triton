@@ -39,13 +39,9 @@ def flash_attention_torch(
             v_chunk = v[:, :, ks:ke]  # [B, H_q, Ck, D]
 
             # Compute scores in float32
-            attn_scores = (
-                torch.matmul(q_chunk.to(torch.float32), k_chunk.transpose(-1, -2).to(torch.float32)) * scale
-            )  # [B, H_q, Cq, Ck]
-            kv_len = k.shape[2]
-            q_len = q.shape[2]
+            attn_scores = torch.matmul(q_chunk, k_chunk.transpose(-1, -2)) * scale  # [B, H_q, Cq, Ck]
             casual_mask = (torch.arange(ks, ke, device=device)[None, None, :]) <= (
-                torch.arange(qs, qe, device=device)[:, None] + (kv_len - q_len)
+                torch.arange(qs, qe, device=device)[:, None] + (L_kv - L)
             )
             attn_scores = torch.where(casual_mask.unsqueeze(0).unsqueeze(0), attn_scores, float("-inf"))
 
