@@ -54,8 +54,8 @@ def flash_attn_kernel(
         q_tile = q_desc.load([q_block_start, 0])
 
         # initialize tmp variables
-        max_score = tl.full((BLOCK_Q,), float("-inf"), dtype=tl.float32)
-        exp_sum = tl.zeros((BLOCK_Q,), dtype=tl.float32)
+        m_i = tl.full((BLOCK_Q, 1), float("-inf"), dtype=tl.float32)
+        l_i = tl.zeros((BLOCK_Q, 1), dtype=tl.float32)
         o_tile = tl.zeros((BLOCK_Q, head_dim), dtype=tl.float32)
 
         # iterate over KV in blocks
@@ -65,28 +65,28 @@ def flash_attn_kernel(
             v_tile = v_desc.load([kv_block_start, 0])
 
             # attn = Q @ K.T * scale
-            scale = 1.0 / (head_dim**0.5)
-            attn = tl.dot(q_tile, k_tile.T) * scale
+            inv_sqrt_d = 1.0 / (head_dim**0.5)
+            scores = tl.dot(q_tile, k_tile.T) * inv_sqrt_d
 
             # apply causal mask
             kv_offsets = (kv_block_start + tl.arange(0, BLOCK_KV))[None, :]
             q_offsets = (q_block_start + (kv_len - q_len) + tl.arange(0, BLOCK_Q))[:, None]
             casual_mask = kv_offsets <= q_offsets
-            attn = tl.where(casual_mask, attn, float("-inf"))
+            scores = tl.where(casual_mask, scores, float("-inf"))
 
             # compute softmax and output
-            tile_max = tl.max(attn, axis=1)
-            max_score_new = tl.maximum(max_score, tile_max)
-            exp_attn = tl.exp(attn - max_score_new[:, None])
+            tile_max = tl.max(scores, axis=1, keep_dims=True)
+            new_m_i = tl.maximum(m_i, tile_max)
+            exp_scores = tl.exp(scores - new_m_i)
 
-            exp_max_diff = tl.exp(max_score - max_score_new)
-            exp_sum = exp_max_diff * exp_sum + tl.sum(exp_attn, axis=1)
-            o_tile = exp_max_diff[:, None] * o_tile + tl.dot(exp_attn.to(v_tile.dtype), v_tile)
+            alpha = tl.exp(m_i - new_m_i)
+            l_i = alpha * l_i + tl.sum(exp_scores, axis=1, keep_dims=True)
+            o_tile = alpha * o_tile + tl.dot(exp_scores.to(v_tile.dtype), v_tile)
 
-            max_score = max_score_new
+            m_i = new_m_i
 
         # finalize output and store
-        o_tile = o_tile / exp_sum[:, None]
+        o_tile = o_tile / l_i
         o_desc = tl.make_tensor_descriptor(
             base=o_ptr + q_head_offset,
             shape=[q_len, head_dim],
@@ -127,18 +127,6 @@ def flash_attn(
         attn_mask=attn_mask,
         is_causal=False,  # we provide the mask explicitly
         enable_gqa=True,  # keep if q/k heads differ by an integer factor
-    )
-
-    bench_by_secs(
-        10,
-        lambda: torch.nn.functional.scaled_dot_product_attention(
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            attn_mask=attn_mask,
-            is_causal=False,  # we provide the mask explicitly
-            enable_gqa=True,  # keep if q/k heads differ by an integer factor
-        ),
     )
 
     gqa_size = q_num_heads // kv_num_heads

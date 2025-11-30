@@ -8,57 +8,64 @@ def flash_attention_torch(
     k: torch.Tensor,
     v: torch.Tensor,
     o: torch.Tensor,
-    q_chunk_size=32,
-    kv_chunk_size=32,
+    q_block_size=32,
+    kv_block_size=32,
 ):
-    B, H_q, L, D = q.shape
-    _, H_kv, L_kv, _ = k.shape
+    B, Hq, Lq, D = q.shape
+    _, Hkv, Lkv, _ = k.shape
 
-    # Support for GQA: repeat k,v heads to match q heads if needed
-    if H_q != H_kv:
-        assert H_q % H_kv == 0, f"Query heads ({H_q}) must be divisible by key/value heads ({H_kv}) for GQA"
-        repeat_factor = H_q // H_kv
-        k = k.repeat_interleave(repeat_factor, dim=1)  # [B, H_q, L_kv, D]
-        v = v.repeat_interleave(repeat_factor, dim=1)  # [B, H_q, L_kv, D]
+    # GQA: repeat kv-heads to match q-heads
+    if Hq != Hkv:
+        assert Hq % Hkv == 0, f"Query heads ({Hq}) must divide KV heads ({Hkv})"
+        gqa_size = Hq // Hkv
+        k = k.repeat_interleave(gqa_size, dim=1)
+        v = v.repeat_interleave(gqa_size, dim=1)
 
-    scale = 1.0 / (D**0.5)
     device = q.device
+    inv_sqrt_d = 1.0 / (D**0.5)
 
-    for qs in range(0, L, q_chunk_size):
-        qe = min(qs + q_chunk_size, L)
-        q_chunk = q[:, :, qs:qe]  # [B, H, Cq, D]
+    # Iterate over Q blocks
+    for qs in range(0, Lq, q_block_size):
+        qe = min(qs + q_block_size, Lq)
+        q_block = q[:, :, qs:qe]  # [B, H, M, D]
+        M = qe - qs
 
-        # Accumulate in float32 for stability
-        max_score = torch.full((B, H_q, qe - qs), float("-inf"), device=device, dtype=torch.float32)  # [B, H_q, Cq]
-        exp_sum = torch.zeros((B, H_q, qe - qs), device=device, dtype=torch.float32)  # [B, H_q, Cq]
-        out_chunk = torch.zeros((B, H_q, qe - qs, D), device=device, dtype=torch.float32)  # [B, H_q, Cq, D]
+        # Running max and exp-sum for softmax
+        m_i = torch.full((B, Hq, M), float("-inf"), device=device, dtype=torch.float32)
+        l_i = torch.zeros((B, Hq, M), device=device, dtype=torch.float32)
+        out_block = torch.zeros((B, Hq, M, D), device=device, dtype=torch.float32)
 
-        for ks in range(0, L_kv, kv_chunk_size):
-            ke = min(ks + kv_chunk_size, L_kv)
-            k_chunk = k[:, :, ks:ke]  # [B, H_q, Ck, D]
-            v_chunk = v[:, :, ks:ke]  # [B, H_q, Ck, D]
+        # Iterate over KV blocks
+        for ks in range(0, Lkv, kv_block_size):
+            ke = min(ks + kv_block_size, Lkv)
+            N = ke - ks
 
-            # Compute scores in float32
-            attn_scores = torch.matmul(q_chunk, k_chunk.transpose(-1, -2)) * scale  # [B, H_q, Cq, Ck]
-            casual_mask = (torch.arange(ks, ke, device=device)[None, None, :]) <= (
-                torch.arange(qs, qe, device=device)[:, None] + (L_kv - L)
-            )
-            attn_scores = torch.where(casual_mask.unsqueeze(0).unsqueeze(0), attn_scores, float("-inf"))
+            # Compute attention scores
+            k_block = k[:, :, ks:ke]  # [B, H, N, D]
+            v_block = v[:, :, ks:ke]  # [B, H, N, D]
+            scores = torch.matmul(q_block, k_block.transpose(-1, -2)) * inv_sqrt_d  # [B, H, M, N]
 
-            block_max = attn_scores.max(dim=-1).values  # [B, H_q, Cq]
-            max_score_new = torch.maximum(max_score, block_max)  # [B, H_q, Cq]
-            exp_scores = torch.exp(attn_scores - max_score_new.unsqueeze(-1))  # [B, H_q, Cq, Ck]
+            # Causal masking
+            kv_offsets = torch.arange(ks, ke, device=device)[None, None, :]
+            q_offsets = torch.arange(qs, qe, device=device)[:, None] + (Lkv - Lq)
+            causal_mask = kv_offsets <= q_offsets
+            scores = torch.where(causal_mask.unsqueeze(0), scores, float("-inf"))
 
-            exp_max_diff = torch.exp(max_score - max_score_new)  # [B, H_q, Cq]
-            exp_sum = exp_max_diff * exp_sum + exp_scores.sum(dim=-1)  # [B, H_q, Cq]
-            out_chunk = exp_max_diff.unsqueeze(-1) * out_chunk + torch.matmul(
-                exp_scores, v_chunk.to(torch.float32)
-            )  # [B, H_q, Cq, D]
+            # Online softmax computation
+            block_m = scores.max(dim=-1).values  # [B, H, M]
+            new_m_i = torch.maximum(m_i, block_m)  # [B, H, M]
+            exp_scores = torch.exp(scores - new_m_i.unsqueeze(-1))  # [B, H, M, N]
 
-            max_score = max_score_new
+            # rescale old l_i and out_block
+            alpha = torch.exp(m_i - new_m_i)  # [B, H, M]
+            l_i = alpha * l_i + exp_scores.sum(dim=-1)  # [B, H, M]
+            out_block = alpha.unsqueeze(-1) * out_block + torch.matmul(exp_scores.to(v_block.dtype), v_block)
 
-        out_chunk = out_chunk / exp_sum.unsqueeze(-1)
-        o[:, :, qs:qe] = out_chunk.to(o.dtype)
+            m_i = new_m_i
+
+        # Normalize
+        out_block = out_block / l_i.unsqueeze(-1)
+        o[:, :, qs:qe] = out_block.to(o.dtype)
 
     return o
 

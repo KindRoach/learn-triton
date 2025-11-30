@@ -9,65 +9,68 @@ def flash_decode_torch(
     v: torch.Tensor,
     o: torch.Tensor,
     split_len=512,
-    kv_chunk_size=32,
+    kv_block_size=32,
 ):
-    B, H_q, L_q, D = q.shape
-    _, H_kv, L, _ = k.shape
+    B, Hq, Lq, D = q.shape
+    _, Hkv, Lkv, _ = k.shape
 
-    assert L_q == 1, "This function only supports decoding with q_len=1"
+    assert Lq == 1, "This function only supports decoding with q_len=1"
 
-    # Support for GQA: repeat k,v heads to match q heads if needed
-    if H_q != H_kv:
-        assert H_q % H_kv == 0, f"Query heads ({H_q}) must be divisible by key/value heads ({H_kv}) for GQA"
-        gqa_size = H_q // H_kv
-        k = k.repeat_interleave(gqa_size, dim=1)  # [B, H_q, L_kv, D]
-        v = v.repeat_interleave(gqa_size, dim=1)  # [B, H_q, L_kv, D]
+    # GQA: repeat KV heads to match Q heads
+    if Hq != Hkv:
+        assert Hq % Hkv == 0, f"Query heads ({Hq}) must divide KV heads ({Hkv})"
+        gqa_size = Hq // Hkv
+        k = k.repeat_interleave(gqa_size, dim=1)
+        v = v.repeat_interleave(gqa_size, dim=1)
 
-    scale = 1.0 / (D**0.5)
     device = q.device
+    inv_sqrt_d = 1.0 / (D**0.5)
 
-    num_split = L // split_len + int(L % split_len != 0)
-    per_split_lse = torch.zeros((B, H_q, num_split), device=device)  # [B, H_q, l_chunk_num]
-    per_split_output = torch.zeros((B, H_q, num_split, D), device=device)  # [B, H_q, l_chunk_num, D]
+    num_splits = Lkv // split_len + int(Lkv % split_len != 0)
+    split_lse = torch.zeros((B, Hq, num_splits), device=device)  # running max per split
+    split_out = torch.zeros((B, Hq, num_splits, D), device=device)  # output per split
 
-    for ls in range(0, L, split_len):
-        le = min(ls + split_len, L)
+    for ls in range(0, Lkv, split_len):
+        le = min(ls + split_len, Lkv)
 
-        # for each l chunk, perform flash attention
-        max_score = torch.full((B, H_q, 1), float("-inf"), device=device)  # [B, H_q, 1]
-        exp_sum = torch.zeros((B, H_q, 1), device=device)  # [B, H_q, 1]
-        out_chunk = torch.zeros((B, H_q, 1, D), device=device)  # [B, H_q, 1, D]
+        # per-split running max and exp-sum
+        m_i = torch.full((B, Hq, 1), float("-inf"), device=device, dtype=torch.float32)
+        l_i = torch.zeros((B, Hq, 1), device=device, dtype=torch.float32)
+        out_block = torch.zeros((B, Hq, 1, D), device=device, dtype=torch.float32)
 
-        for ks in range(ls, le, kv_chunk_size):
-            ke = min(ks + kv_chunk_size, le)
-            k_chunk = k[:, :, ks:ke]  # [B, H_q, Ck, D]
-            v_chunk = v[:, :, ks:ke]  # [B, H_q, Ck, D]
+        # iterate over KV blocks
+        for ks in range(ls, le, kv_block_size):
+            ke = min(ks + kv_block_size, le)
+            k_block = k[:, :, ks:ke]  # [B, H, N, D]
+            v_block = v[:, :, ks:ke]  # [B, H, N, D]
+            N = ke - ks
 
-            attn_scores = torch.matmul(q, k_chunk.transpose(-1, -2)) * scale  # [B, H_q, 1, Ck]
+            scores = torch.matmul(q, k_block.transpose(-1, -2)) * inv_sqrt_d  # [B, H, 1, N]
 
-            block_max = attn_scores.max(dim=-1).values  # [B, H_q, 1]
-            max_score_new = torch.maximum(max_score, block_max)  # [B, H_q, 1]
-            exp_scores = torch.exp(attn_scores - max_score_new.unsqueeze(-1))  # [B, H_q, 1, Ck]
+            # running max and exp sum
+            block_m = scores.max(dim=-1).values  # [B, H, 1]
+            new_m_i = torch.maximum(m_i, block_m)  # [B, H, 1]
+            exp_scores = torch.exp(scores - new_m_i.unsqueeze(-1))  # [B, H, 1, N]
 
-            exp_max_diff = torch.exp(max_score - max_score_new)  # [B, H_q, 1]
-            exp_sum = exp_max_diff * exp_sum + exp_scores.sum(dim=-1)  # [B, H_q, 1]
-            out_chunk = exp_max_diff.unsqueeze(-1) * out_chunk + torch.matmul(
-                exp_scores.to(v_chunk.dtype), v_chunk
-            )  # [B, H_q, 1, D]
+            alpha = torch.exp(m_i - new_m_i)  # [B, H, 1]
+            l_i = alpha * l_i + exp_scores.sum(dim=-1)  # [B, H, 1]
+            out_block = alpha.unsqueeze(-1) * out_block + torch.matmul(
+                exp_scores.to(v_block.dtype), v_block
+            )  # [B, H, 1, D]
 
-            max_score = max_score_new
+            m_i = new_m_i
 
-        out_chunk = out_chunk / exp_sum.unsqueeze(-1)
+        out_block = out_block / l_i.unsqueeze(-1)
 
-        # record output and lse for each l chunk
-        split_i = ls // split_len
-        per_split_lse[:, :, split_i : split_i + 1] = torch.log(exp_sum) + max_score  # [B, H_q, 1]
-        per_split_output[:, :, split_i : split_i + 1] = out_chunk  # [B, H_q, 1, D]
+        # store per-split outputs
+        split_idx = ls // split_len
+        split_lse[:, :, split_idx : split_idx + 1] = torch.log(l_i) + m_i
+        split_out[:, :, split_idx : split_idx + 1] = out_block
 
-    # reduce refer to https://github.com/Dao-AILab/flash-attention/issues/1248
-    lse_final = torch.logsumexp(per_split_lse, dim=2, keepdim=True)  # [B, H_q, 1]
-    exp_final = torch.exp(per_split_lse - lse_final).unsqueeze(2)  # [B, H_q, 1, l_chunk_num]
-    o[:] = torch.matmul(exp_final, per_split_output)  # [B, H_q, 1, D]
+    # final reduction over splits
+    lse_final = torch.logsumexp(split_lse, dim=2, keepdim=True)  # [B, H, 1]
+    exp_final = torch.exp(split_lse - lse_final).unsqueeze(2)  # [B, H, 1, num_splits]
+    o[:] = torch.matmul(exp_final, split_out)  # [B, H, 1, D]
 
     return o
 
