@@ -6,6 +6,93 @@ from ..utils import acc_check, bench_by_secs, enable_tma_allocator, get_device
 
 
 @triton.jit
+def load_1D_kernel(
+    x_ptr: tl.pointer_type,
+    N: int,
+    BLOCK: tl.constexpr,
+):
+    desc = tl.make_tensor_descriptor(
+        base=x_ptr,
+        shape=[N],
+        strides=[1],
+        block_shape=[BLOCK],
+    )
+
+    pid = tl.program_id(0)
+    x = desc.load([pid * BLOCK])
+    print("x", x)
+
+
+def load_1D():
+    print(f"{'='*20} 1D load {'='*20}")
+    # the first 16 elements will be loaded
+    # the rest elements are out of bound and masked as 0
+    N = 16
+    BLOCK = 32
+
+    device = get_device()
+    dtype = torch.float32
+    input_tensor = torch.randn(N, dtype=dtype, device=device)
+
+    grid = (triton.cdiv(N, BLOCK),)
+
+    load_1D_kernel[grid](
+        input_tensor,
+        N,
+        BLOCK,
+        num_warps=1,
+    )
+
+
+@triton.jit
+def load_2D_kernel(
+    x_ptr: tl.pointer_type,
+    M: int,
+    N: int,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    desc = tl.make_tensor_descriptor(
+        base=x_ptr,
+        shape=[M, N],
+        strides=[N, 1],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    x = desc.load([pid_m * BLOCK_M, pid_n * BLOCK_N])
+
+    print("x", x)
+
+def load_2D():
+    print(f"{'='*20} 2D load {'='*20}")
+    # the first 7 rows will be loaded
+    # the last row is out of bound and masked as 0
+    M = 7
+    N = 8
+    BLOCK_M = 8
+    BLOCK_N = 8
+
+    device = get_device()
+    dtype = torch.float32
+    input_tensor = torch.randn(M, N, dtype=dtype, device=device)
+
+    grid = (
+        triton.cdiv(M, BLOCK_M),
+        triton.cdiv(N, BLOCK_N),
+    )
+
+    load_2D_kernel[grid](
+        input_tensor,
+        M,
+        N,
+        BLOCK_M,
+        BLOCK_N,
+        num_warps=1,
+    )
+
+@triton.jit
 def copy_1D_kernel(
     input_ptr: tl.pointer_type,
     output_ptr: tl.pointer_type,
@@ -131,5 +218,7 @@ def copy_2D():
 
 if __name__ == "__main__":
     enable_tma_allocator()
+    load_1D()
+    load_2D()
     copy_1D()
     copy_2D()
