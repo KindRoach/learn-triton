@@ -34,11 +34,86 @@ def transpose_kernel(
     out_desc.store([tile_n, tile_m], tl.trans(in_tile))
 
 
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK_M": block_m,
+                "BLOCK_N": block_n,
+            },
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        for block_m in [32, 64, 128]
+        for block_n in [32, 64, 128]
+        for num_stages in [1, 2, 3, 4]
+        for num_warps in [1, 2, 4, 8, 16, 32]
+    ],
+    key=["M", "N"],
+    cache_results=True,
+)
+@triton.jit
+def transpose_autotune_kernel(
+    in_ptr,
+    out_ptr,
+    M: int,
+    N: int,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    transpose_kernel(
+        in_ptr,
+        out_ptr,
+        M,
+        N,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+    )
+
+
+def transpose(
+    input_tensor: torch.Tensor,
+    output_tensor: torch.Tensor,
+) -> None:
+    M, N = input_tensor.shape
+    BLOCK_M = 64
+    BLOCK_N = 64
+    grid = (
+        triton.cdiv(M, BLOCK_M),
+        triton.cdiv(N, BLOCK_N),
+    )
+    transpose_kernel[grid](
+        input_tensor,
+        output_tensor,
+        M,
+        N,
+        tl.constexpr(BLOCK_M),
+        tl.constexpr(BLOCK_N),
+    )
+
+
+def transpose_autotune(
+    input_tensor: torch.Tensor,
+    output_tensor: torch.Tensor,
+) -> None:
+    M, N = input_tensor.shape
+
+    grid = lambda meta: (
+        triton.cdiv(M, meta["BLOCK_M"]),
+        triton.cdiv(N, meta["BLOCK_N"]),
+    )
+
+    transpose_autotune_kernel[grid](
+        input_tensor,
+        output_tensor,
+        M,
+        N,
+    )
+
+
 def transpose_2D():
     M = 20 * 1024
     N = 5 * 1024
-    BLOCK_M = 64
-    BLOCK_N = 64
 
     device = get_device()
     dtype = torch.float32
@@ -46,27 +121,21 @@ def transpose_2D():
     input_tensor = torch.randn((M, N), dtype=dtype, device=device)
     output_tensor = torch.empty((N, M), dtype=dtype, device=device)
 
-    grid = (
-        triton.cdiv(M, BLOCK_M),
-        triton.cdiv(N, BLOCK_N),
-    )
+    funcs_to_bench = {transpose.__name__: transpose, transpose_autotune.__name__: transpose_autotune}
 
-    bench_by_secs(
-        10,
-        lambda: transpose_kernel[grid](
-            input_tensor,
-            output_tensor,
-            M,
-            N,
-            BLOCK_M,
-            BLOCK_N,
-        ),
-        mem_access_bytes=input_tensor.element_size() * input_tensor.nelement() * 2,  # 1 read + 1 write
-    )
+    mem_access_bytes = input_tensor.element_size() * input_tensor.nelement() * 2
 
-    # Verification
-    expected = input_tensor.transpose(0, 1)
-    acc_check(expected, output_tensor)
+    for name, func in funcs_to_bench.items():
+        print(f"\nBenchmarking {name}...")
+        bench_by_secs(
+            10,
+            lambda: func(input_tensor, output_tensor),
+            mem_access_bytes=mem_access_bytes,  # 1 read + 1 write
+        )
+
+        # Verification
+        expected = input_tensor.transpose(0, 1)
+        acc_check(expected, output_tensor)
 
 
 if __name__ == "__main__":
