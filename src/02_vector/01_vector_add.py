@@ -38,9 +38,62 @@ def vector_add_kernel(
     out_desc.store([tl.program_id(0) * BLOCK], out_tile)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK": block_size,
+            },
+            num_stages=num_stages,
+            num_warps=num_warps,
+        )
+        for block_size in [256, 512, 1024]
+        for num_stages in [1, 2, 3, 4]
+        for num_warps in [1, 2, 4, 8, 16, 32]
+    ],
+    key=["N"],
+    cache_results=True,
+)
+@triton.jit
+def vector_add_autotune_kernel(
+    x_ptr: tl.pointer_type,
+    y_ptr: tl.pointer_type,
+    out_ptr: tl.pointer_type,
+    N: int,
+    BLOCK: tl.constexpr,
+):
+    vector_add_kernel(
+        x_ptr,
+        y_ptr,
+        out_ptr,
+        N,
+        BLOCK=BLOCK,
+    )
+
+
+def vector_add(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    BLOCK = 1024
+    N = x.shape[0]
+    grid = (triton.cdiv(N, BLOCK),)
+    vector_add_kernel[grid](x, y, out, N, BLOCK)
+
+
+def vector_add_autotune(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    N = x.shape[0]
+    grid = lambda meta: (triton.cdiv(N, meta["BLOCK"]),)
+    vector_add_autotune_kernel[grid](x, y, out, N)
+
+
 def main():
     N = (100 * 1024 * 1024) - 3
-    BLOCK = 1024
 
     # Initialize input tensors
     device = get_device()
@@ -49,19 +102,23 @@ def main():
     y = torch.randn(N, device=device, dtype=dtype)
     z = torch.empty_like(x)
 
-    grid = (triton.cdiv(N, BLOCK),)
+    funcs_to_bench = {
+        vector_add.__name__: vector_add,
+        vector_add_autotune.__name__: vector_add_autotune,
+    }
 
-    bench_by_secs(
-        10,
-        lambda: vector_add_kernel[grid](x, y, z, N, tl.constexpr(BLOCK)),
-        mem_access_bytes=x.element_size() * x.nelement() * 3,  # 2 reads + 1 write
-        total_flops=x.nelement(),  # 1 addition per element
-    )
+    for name, func in funcs_to_bench.items():
+        print(f"\nBenchmarking {name}...")
+        bench_by_secs(
+            10,
+            lambda: func(x, y, z),
+            mem_access_bytes=x.element_size() * x.nelement() * 3,  # 2 reads + 1 write
+            total_flops=x.nelement(),  # 1 addition per element
+        )
 
-    # Validate correctness
-    expected = x + y
-
-    acc_check(expected, z)
+        # Validate correctness
+        expected = x + y
+        acc_check(expected, z)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,14 @@
+import os
 import sys
 import time
 import torch
 from typing import Optional
 
 import triton
+
+
+# Print autotuning logs
+os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 
 
 def bench_by_secs(
@@ -46,9 +51,9 @@ def bench_by_secs(
         duration_str = f"{avg_duration * 1_000_000:.3f} µs"
 
     print(
-        f"Executed {count} iterations in {secs:.2f} seconds."
-        f" Throughput: {count/secs:.2f} iters/sec."
-        f" Avg duration: {duration_str}."
+        f"Executed {count} iterations in {secs:.2f} seconds.\n"
+        f"Throughput: {count/secs:.2f} iters/sec.\n"
+        f"Avg duration: {duration_str}."
     )
 
     # Calculate and display memory bandwidth and FLOPs if provided
@@ -67,7 +72,7 @@ def bench_by_secs(
         else:
             bandwidth_str = f"{mem_bandwidth_bytes_per_sec:.2f} B/s"
 
-        print(f" Memory bandwidth: {bandwidth_str}")
+        print(f"Memory bandwidth: {bandwidth_str}")
 
     if total_flops is not None:
         flops_per_sec = (total_flops * count) / secs
@@ -82,7 +87,7 @@ def bench_by_secs(
         else:
             flops_str = f"{flops_per_sec:.2f} FLOP/s"
 
-        print(f" Compute throughput: {flops_str}")
+        print(f"Compute throughput: {flops_str}")
 
 
 def acc_check(

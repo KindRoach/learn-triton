@@ -1,13 +1,8 @@
-import os
 import torch
 import triton
 import triton.language as tl
 
 from ..utils import get_device
-
-# Show how autotuning works, not necessarily for normal use cases
-os.environ["TRITON_CACHE_DISABLE"] = "1"
-os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 
 
 @triton.autotune(
