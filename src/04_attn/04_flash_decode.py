@@ -99,6 +99,47 @@ def flash_decode_kernel_split(
         tl.store(lse_ptr + lse_offset, lse)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK_KV": block_kv,
+            },
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        for block_kv in [16, 32, 64]
+        for num_warps in [1, 2, 4, 8, 16]
+        for num_stages in [1, 2, 3]
+    ],
+    key=["gqa_size", "head_dim"],
+    cache_results=True,
+)
+@triton.jit
+def flash_decode_kernel_split_autotune(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    o_ptr,
+    lse_ptr,
+    kv_len,
+    head_dim: tl.constexpr,
+    gqa_size: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+):
+    flash_decode_kernel_split(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        o_ptr,
+        lse_ptr,
+        kv_len,
+        head_dim,
+        gqa_size,
+        BLOCK_KV,
+    )
+
+
 @triton.jit
 def flash_decode_kernel_reduce(
     split_o_ptr,
@@ -166,7 +207,42 @@ def flash_decode_kernel_reduce(
     o_desc.store([q_head_id, 0], o_tile.to(o_desc.dtype))
 
 
-def triton_flash_decode(
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK_SPLIT": block_split,
+            },
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        for block_split in [16, 32, 64]
+        for num_warps in [1, 2, 4, 8, 16]
+        for num_stages in [1, 2, 3]
+    ],
+    key=["gqa_size", "head_dim"],
+    cache_results=True,
+)
+@triton.jit
+def flash_decode_kernel_reduce_autotune(
+    split_o_ptr,
+    split_lse_ptr,
+    o_ptr,
+    split_num: int,
+    head_dim: tl.constexpr,
+    BLOCK_SPLIT: tl.constexpr,
+):
+    flash_decode_kernel_reduce(
+        split_o_ptr,
+        split_lse_ptr,
+        o_ptr,
+        split_num,
+        head_dim,
+        BLOCK_SPLIT,
+    )
+
+
+def flash_decode(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -217,7 +293,53 @@ def triton_flash_decode(
     )
 
 
-def flash_decode(
+def flash_decode_autotune(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    split_len=512,
+):
+    batch_size, q_num_heads, q_len, head_dim = q.shape
+    _, kv_num_heads, kv_len, _ = k.shape
+
+    assert q_len == 1, "Only decoding with q_len=1 is supported."
+
+    gqa_size = q_num_heads // kv_num_heads
+    split_num = int(triton.cdiv(kv_len, split_len))
+    grid_split = (
+        batch_size,
+        kv_num_heads,
+        split_num,
+    )
+
+    per_split_o = torch.empty((batch_size, q_num_heads, split_num, head_dim), device=q.device, dtype=q.dtype)
+    per_split_lse = torch.empty((batch_size, q_num_heads, split_num), device=q.device, dtype=q.dtype)
+    flash_decode_kernel_split_autotune[grid_split](
+        q_ptr=q,
+        k_ptr=k,
+        v_ptr=v,
+        o_ptr=per_split_o,
+        lse_ptr=per_split_lse,
+        kv_len=kv_len,
+        head_dim=head_dim,
+        gqa_size=gqa_size,
+    )
+
+    grid_reduce = (
+        batch_size,
+        q_num_heads,
+    )
+    flash_decode_kernel_reduce_autotune[grid_reduce](
+        split_o_ptr=per_split_o,
+        split_lse_ptr=per_split_lse,
+        o_ptr=o,
+        split_num=split_num,
+        head_dim=head_dim,
+    )
+
+
+def flash_decode_exp(
     batch_size: int,
     kv_len: int,
     q_num_heads: int,
@@ -241,22 +363,23 @@ def flash_decode(
         enable_gqa=True,
     )
 
-    bench_by_secs(
-        10,
-        lambda: triton_flash_decode(
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            o_tensor,
-        ),
-    )
+    funcs_to_bench = {
+        flash_decode.__name__: flash_decode,
+        flash_decode_autotune.__name__: flash_decode_autotune,
+    }
 
-    acc_check(excepted, o_tensor)
+    for name, func in funcs_to_bench.items():
+        print(f"\nBenchmarking {name}...")
+        bench_by_secs(
+            10,
+            lambda: func(q_tensor, k_tensor, v_tensor, o_tensor),
+        )
+        acc_check(excepted, o_tensor)
 
 
 if __name__ == "__main__":
     enable_tma_allocator()
-    flash_decode(
+    flash_decode_exp(
         batch_size=1,
         kv_len=16 * 1024,
         q_num_heads=28,

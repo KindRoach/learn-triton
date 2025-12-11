@@ -96,7 +96,113 @@ def flash_attn_kernel(
         o_desc.store([q_block_start, 0], o_tile.to(o_desc.dtype))
 
 
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK_Q": block_q,
+                "BLOCK_KV": block_kv,
+            },
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        for block_q in [16, 32, 64]
+        for block_kv in [16, 32, 64]
+        for num_warps in [1, 2, 4, 8, 16]
+        for num_stages in [1, 2, 3]
+    ],
+    key=["gqa_size", "head_dim"],
+    cache_results=True,
+)
+@triton.jit
+def flash_attn_autotune_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    o_ptr,
+    q_len,
+    kv_len,
+    head_dim: tl.constexpr,
+    gqa_size: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+):
+    flash_attn_kernel(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        o_ptr,
+        q_len,
+        kv_len,
+        head_dim,
+        gqa_size,
+        BLOCK_Q,
+        BLOCK_KV,
+    )
+
+
 def flash_attn(
+    q_tensor,
+    k_tensor,
+    v_tensor,
+    o_tensor,
+) -> None:
+    batch_size, q_num_heads, q_len, head_dim = q_tensor.shape
+    _, kv_num_heads, kv_len, _ = k_tensor.shape
+    gqa_size = q_num_heads // kv_num_heads
+
+    BLOCK_Q = 32
+    BLOCK_KV = 32
+
+    grid = (
+        batch_size,
+        kv_num_heads,
+        triton.cdiv(q_len, BLOCK_Q),
+    )
+
+    flash_attn_kernel[grid](
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        o_tensor,
+        q_len,
+        kv_len,
+        head_dim,
+        gqa_size,
+        BLOCK_Q,
+        BLOCK_KV,
+    )
+
+
+def flash_attn_autotune(
+    q_tensor,
+    k_tensor,
+    v_tensor,
+    o_tensor,
+) -> None:
+    batch_size, q_num_heads, q_len, head_dim = q_tensor.shape
+    _, kv_num_heads, kv_len, _ = k_tensor.shape
+    gqa_size = q_num_heads // kv_num_heads
+
+    grid = lambda meta: (
+        batch_size,
+        kv_num_heads,
+        triton.cdiv(q_len, meta["BLOCK_Q"]),
+    )
+
+    flash_attn_autotune_kernel[grid](
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        o_tensor,
+        q_len,
+        kv_len,
+        head_dim,
+        gqa_size,
+    )
+
+
+def flash_attn_exp(
     batch_size: int,
     q_len: int,
     kv_len: int,
@@ -129,37 +235,23 @@ def flash_attn(
         enable_gqa=True,  # keep if q/k heads differ by an integer factor
     )
 
-    gqa_size = q_num_heads // kv_num_heads
-    BLOCK_Q = 32
-    BLOCK_KV = 32
-    grid = (
-        batch_size,
-        kv_num_heads,
-        triton.cdiv(q_len, BLOCK_Q),
-    )
+    funcs_to_bench = {
+        flash_attn.__name__: flash_attn,
+        flash_attn_autotune.__name__: flash_attn_autotune,
+    }
 
-    bench_by_secs(
-        10,
-        lambda: flash_attn_kernel[grid](
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            o_tensor,
-            q_len,
-            kv_len,
-            head_dim,
-            gqa_size,
-            BLOCK_Q,
-            BLOCK_KV,
-        ),
-    )
-
-    acc_check(excepted, o_tensor)
+    for name, func in funcs_to_bench.items():
+        print(f"\nBenchmarking {name}...")
+        bench_by_secs(
+            10,
+            lambda: func(q_tensor, k_tensor, v_tensor, o_tensor),
+        )
+        acc_check(excepted, o_tensor)
 
 
 if __name__ == "__main__":
     enable_tma_allocator()
-    flash_attn(
+    flash_attn_exp(
         batch_size=1,
         q_len=4 * 1024,
         kv_len=16 * 1024,
