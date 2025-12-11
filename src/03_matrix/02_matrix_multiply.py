@@ -118,9 +118,9 @@ def matrix_multiply(
         M,
         N,
         K,
-        tl.constexpr(BLOCK_M),
-        tl.constexpr(BLOCK_N),
-        tl.constexpr(BLOCK_K),
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
     )
 
 

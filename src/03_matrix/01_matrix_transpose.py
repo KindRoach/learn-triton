@@ -87,8 +87,8 @@ def transpose(
         output_tensor,
         M,
         N,
-        tl.constexpr(BLOCK_M),
-        tl.constexpr(BLOCK_N),
+        BLOCK_M,
+        BLOCK_N,
     )
 
 
