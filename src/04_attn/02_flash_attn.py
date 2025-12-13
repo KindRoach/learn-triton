@@ -11,42 +11,42 @@ def flash_attn_kernel(
     k_ptr,
     v_ptr,
     o_ptr,
-    q_len,
-    kv_len,
-    head_dim: tl.constexpr,
-    gqa_size: tl.constexpr,
+    q_len: int,
+    kv_len: int,
+    gqa_size: int,
+    HEAD_DIM: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_KV: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
     kv_head_id = tl.program_id(1)
     kv_num_heads = tl.num_programs(1)
-    kv_offset = (batch_id * kv_num_heads + kv_head_id) * kv_len * head_dim
+    kv_offset = (batch_id * kv_num_heads + kv_head_id) * kv_len * HEAD_DIM
 
     k_desc = tl.make_tensor_descriptor(
         base=k_ptr + kv_offset,
-        shape=[kv_len, head_dim],
-        strides=[head_dim, 1],
-        block_shape=[BLOCK_KV, head_dim],
+        shape=[kv_len, HEAD_DIM],
+        strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_KV, HEAD_DIM],
     )
 
     v_desc = tl.make_tensor_descriptor(
         base=v_ptr + kv_offset,
-        shape=[kv_len, head_dim],
-        strides=[head_dim, 1],
-        block_shape=[BLOCK_KV, head_dim],
+        shape=[kv_len, HEAD_DIM],
+        strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_KV, HEAD_DIM],
     )
 
     # iterate over GQA heads
     for q_gqa_head_id in range(0, gqa_size):
         q_num_heads = kv_num_heads * gqa_size
         q_global_head_id = kv_head_id * gqa_size + q_gqa_head_id
-        q_head_offset = (batch_id * q_num_heads + q_global_head_id) * q_len * head_dim
+        q_head_offset = (batch_id * q_num_heads + q_global_head_id) * q_len * HEAD_DIM
         q_desc = tl.make_tensor_descriptor(
             base=q_ptr + q_head_offset,
-            shape=[q_len, head_dim],
-            strides=[head_dim, 1],
-            block_shape=[BLOCK_Q, head_dim],
+            shape=[q_len, HEAD_DIM],
+            strides=[HEAD_DIM, 1],
+            block_shape=[BLOCK_Q, HEAD_DIM],
         )
 
         # Load Q tile
@@ -56,7 +56,7 @@ def flash_attn_kernel(
         # initialize tmp variables
         m_i = tl.full((BLOCK_Q, 1), float("-inf"), dtype=tl.float32)
         l_i = tl.zeros((BLOCK_Q, 1), dtype=tl.float32)
-        o_tile = tl.zeros((BLOCK_Q, head_dim), dtype=tl.float32)
+        o_tile = tl.zeros((BLOCK_Q, HEAD_DIM), dtype=tl.float32)
 
         # iterate over KV in blocks
         for kv_block_start in range(0, kv_len, BLOCK_KV):
@@ -65,7 +65,7 @@ def flash_attn_kernel(
             v_tile = v_desc.load([kv_block_start, 0])
 
             # attn = Q @ K.T * scale
-            inv_sqrt_d = 1.0 / (head_dim**0.5)
+            inv_sqrt_d = 1.0 / (HEAD_DIM**0.5)
             scores = tl.dot(q_tile, k_tile.T) * inv_sqrt_d
 
             # apply causal mask
@@ -89,9 +89,9 @@ def flash_attn_kernel(
         o_tile = o_tile / l_i
         o_desc = tl.make_tensor_descriptor(
             base=o_ptr + q_head_offset,
-            shape=[q_len, head_dim],
-            strides=[head_dim, 1],
-            block_shape=[BLOCK_Q, head_dim],
+            shape=[q_len, HEAD_DIM],
+            strides=[HEAD_DIM, 1],
+            block_shape=[BLOCK_Q, HEAD_DIM],
         )
         o_desc.store([q_block_start, 0], o_tile.to(o_desc.dtype))
 
@@ -111,7 +111,7 @@ def flash_attn_kernel(
         for num_warps in [1, 2, 4, 8, 16]
         for num_stages in [1, 2, 3]
     ],
-    key=["gqa_size", "head_dim"],
+    key=["HEAD_DIM"],
     cache_results=True,
 )
 @triton.jit
@@ -120,10 +120,10 @@ def flash_attn_autotune_kernel(
     k_ptr,
     v_ptr,
     o_ptr,
-    q_len,
-    kv_len,
-    head_dim: tl.constexpr,
-    gqa_size: tl.constexpr,
+    q_len: int,
+    kv_len: int,
+    gqa_size: int,
+    HEAD_DIM: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_KV: tl.constexpr,
 ):
@@ -134,8 +134,8 @@ def flash_attn_autotune_kernel(
         o_ptr,
         q_len,
         kv_len,
-        head_dim,
         gqa_size,
+        HEAD_DIM,
         BLOCK_Q,
         BLOCK_KV,
     )
@@ -161,16 +161,16 @@ def flash_attn(
     )
 
     flash_attn_kernel[grid](
-        q_tensor,
-        k_tensor,
-        v_tensor,
-        o_tensor,
-        q_len,
-        kv_len,
-        head_dim,
-        gqa_size,
-        BLOCK_Q,
-        BLOCK_KV,
+        q_ptr=q_tensor,
+        k_ptr=k_tensor,
+        v_ptr=v_tensor,
+        o_ptr=o_tensor,
+        q_len=q_len,
+        kv_len=kv_len,
+        gqa_size=gqa_size,
+        HEAD_DIM=head_dim,
+        BLOCK_Q=BLOCK_Q,
+        BLOCK_KV=BLOCK_KV,
     )
 
 
@@ -191,14 +191,14 @@ def flash_attn_autotune(
     )
 
     flash_attn_autotune_kernel[grid](
-        q_tensor,
-        k_tensor,
-        v_tensor,
-        o_tensor,
-        q_len,
-        kv_len,
-        head_dim,
-        gqa_size,
+        q_ptr=q_tensor,
+        k_ptr=k_tensor,
+        v_ptr=v_tensor,
+        o_ptr=o_tensor,
+        q_len=q_len,
+        kv_len=kv_len,
+        gqa_size=gqa_size,
+        HEAD_DIM=head_dim,
     )
 
 

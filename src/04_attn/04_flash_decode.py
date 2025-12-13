@@ -12,9 +12,9 @@ def flash_decode_kernel_split(
     v_ptr,
     o_ptr,
     lse_ptr,
-    kv_len,
-    head_dim: tl.constexpr,
-    gqa_size: tl.constexpr,
+    kv_len: int,
+    gqa_size: int,
+    HEAD_DIM: tl.constexpr,
     BLOCK_KV: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
@@ -22,27 +22,27 @@ def flash_decode_kernel_split(
     kv_num_heads = tl.num_programs(1)
     q_num_heads = kv_num_heads * gqa_size
 
-    q_offset = batch_id * q_num_heads * head_dim
+    q_offset = batch_id * q_num_heads * HEAD_DIM
     q_desc = tl.make_tensor_descriptor(
         base=q_ptr + q_offset,
-        shape=[q_num_heads, head_dim],
-        strides=[head_dim, 1],
-        block_shape=[1, head_dim],
+        shape=[q_num_heads, HEAD_DIM],
+        strides=[HEAD_DIM, 1],
+        block_shape=[1, HEAD_DIM],
     )
 
-    kv_offset = (batch_id * kv_num_heads + kv_head_id) * kv_len * head_dim
+    kv_offset = (batch_id * kv_num_heads + kv_head_id) * kv_len * HEAD_DIM
     k_desc = tl.make_tensor_descriptor(
         base=k_ptr + kv_offset,
-        shape=[kv_len, head_dim],
-        strides=[head_dim, 1],
-        block_shape=[BLOCK_KV, head_dim],
+        shape=[kv_len, HEAD_DIM],
+        strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_KV, HEAD_DIM],
     )
 
     v_desc = tl.make_tensor_descriptor(
         base=v_ptr + kv_offset,
-        shape=[kv_len, head_dim],
-        strides=[head_dim, 1],
-        block_shape=[BLOCK_KV, head_dim],
+        shape=[kv_len, HEAD_DIM],
+        strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_KV, HEAD_DIM],
     )
 
     # iterate over GQA heads
@@ -54,7 +54,7 @@ def flash_decode_kernel_split(
         # initialize tmp variables
         m_i = tl.full((1,), float("-inf"), dtype=tl.float32)
         l_i = tl.zeros((1,), dtype=tl.float32)
-        o_tile = tl.zeros((1, head_dim), dtype=tl.float32)
+        o_tile = tl.zeros((1, HEAD_DIM), dtype=tl.float32)
 
         # iterate over KV in blocks
         for kv_block_start in range(0, kv_len, BLOCK_KV):
@@ -63,7 +63,7 @@ def flash_decode_kernel_split(
             v_tile = v_desc.load([kv_block_start, 0])
 
             # attn = Q @ K.T * scale
-            inv_sqrt_d = 1.0 / (head_dim**0.5)
+            inv_sqrt_d = 1.0 / (HEAD_DIM**0.5)
             scores = tl.dot(q_tile, k_tile.T) * inv_sqrt_d
 
             # compute softmax and output
@@ -85,12 +85,12 @@ def flash_decode_kernel_split(
         split_num = tl.num_programs(2)
 
         # o in [B, H_q, split_num, head_dim]
-        o_offset = (batch_id * q_num_heads + q_global_head_id) * split_num * head_dim
+        o_offset = (batch_id * q_num_heads + q_global_head_id) * split_num * HEAD_DIM
         o_desc = tl.make_tensor_descriptor(
             base=o_ptr + o_offset,
-            shape=[split_num, head_dim],
-            strides=[head_dim, 1],
-            block_shape=[1, head_dim],
+            shape=[split_num, HEAD_DIM],
+            strides=[HEAD_DIM, 1],
+            block_shape=[1, HEAD_DIM],
         )
         o_desc.store([split_id, 0], o_tile.to(o_desc.dtype))
 
@@ -112,7 +112,7 @@ def flash_decode_kernel_split(
         for num_warps in [1, 2, 4, 8, 16]
         for num_stages in [1, 2, 3]
     ],
-    key=["gqa_size", "head_dim"],
+    key=["HEAD_DIM"],
     cache_results=True,
 )
 @triton.jit
@@ -122,9 +122,9 @@ def flash_decode_kernel_split_autotune(
     v_ptr,
     o_ptr,
     lse_ptr,
-    kv_len,
-    head_dim: tl.constexpr,
-    gqa_size: tl.constexpr,
+    kv_len: int,
+    gqa_size: int,
+    HEAD_DIM: tl.constexpr,
     BLOCK_KV: tl.constexpr,
 ):
     flash_decode_kernel_split(
@@ -134,8 +134,8 @@ def flash_decode_kernel_split_autotune(
         o_ptr,
         lse_ptr,
         kv_len,
-        head_dim,
         gqa_size,
+        HEAD_DIM,
         BLOCK_KV,
     )
 
@@ -146,7 +146,7 @@ def flash_decode_kernel_reduce(
     split_lse_ptr,
     o_ptr,
     split_num: int,
-    head_dim: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
     BLOCK_SPLIT: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
@@ -154,12 +154,12 @@ def flash_decode_kernel_reduce(
     q_num_heads = tl.num_programs(1)
 
     seq_idx = batch_id * q_num_heads + q_head_id
-    split_o_base = split_o_ptr + seq_idx * split_num * head_dim
+    split_o_base = split_o_ptr + seq_idx * split_num * HEAD_DIM
     split_o_desc = tl.make_tensor_descriptor(
         base=split_o_base,
-        shape=[split_num, head_dim],
-        strides=[head_dim, 1],
-        block_shape=[BLOCK_SPLIT, head_dim],
+        shape=[split_num, HEAD_DIM],
+        strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_SPLIT, HEAD_DIM],
     )
 
     split_lse_base = split_lse_ptr + seq_idx * split_num
@@ -172,7 +172,7 @@ def flash_decode_kernel_reduce(
 
     m_i = tl.full((1,), float("-inf"), dtype=tl.float32)
     l_i = tl.zeros((1,), dtype=tl.float32)
-    o_tile = tl.zeros((1, head_dim), dtype=tl.float32)
+    o_tile = tl.zeros((1, HEAD_DIM), dtype=tl.float32)
 
     for split_start in range(0, split_num, BLOCK_SPLIT):
 
@@ -197,12 +197,12 @@ def flash_decode_kernel_reduce(
 
     # finalize output and store
     o_tile = o_tile / l_i
-    o_base = o_ptr + batch_id * q_num_heads * head_dim
+    o_base = o_ptr + batch_id * q_num_heads * HEAD_DIM
     o_desc = tl.make_tensor_descriptor(
         base=o_base,
-        shape=[q_num_heads, head_dim],
-        strides=[head_dim, 1],
-        block_shape=[1, head_dim],
+        shape=[q_num_heads, HEAD_DIM],
+        strides=[HEAD_DIM, 1],
+        block_shape=[1, HEAD_DIM],
     )
     o_desc.store([q_head_id, 0], o_tile.to(o_desc.dtype))
 
@@ -220,7 +220,7 @@ def flash_decode_kernel_reduce(
         for num_warps in [1, 2, 4, 8, 16]
         for num_stages in [1, 2, 3]
     ],
-    key=["gqa_size", "head_dim"],
+    key=["HEAD_DIM"],
     cache_results=True,
 )
 @triton.jit
@@ -229,7 +229,7 @@ def flash_decode_kernel_reduce_autotune(
     split_lse_ptr,
     o_ptr,
     split_num: int,
-    head_dim: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
     BLOCK_SPLIT: tl.constexpr,
 ):
     flash_decode_kernel_reduce(
@@ -237,7 +237,7 @@ def flash_decode_kernel_reduce_autotune(
         split_lse_ptr,
         o_ptr,
         split_num,
-        head_dim,
+        HEAD_DIM,
         BLOCK_SPLIT,
     )
 
@@ -273,8 +273,8 @@ def flash_decode(
         o_ptr=per_split_o,
         lse_ptr=per_split_lse,
         kv_len=kv_len,
-        head_dim=head_dim,
         gqa_size=gqa_size,
+        HEAD_DIM=head_dim,
         BLOCK_KV=block_kv,
     )
 
@@ -288,7 +288,7 @@ def flash_decode(
         split_lse_ptr=per_split_lse,
         o_ptr=o,
         split_num=split_num,
-        head_dim=head_dim,
+        HEAD_DIM=head_dim,
         BLOCK_SPLIT=block_kv,
     )
 
@@ -322,8 +322,8 @@ def flash_decode_autotune(
         o_ptr=per_split_o,
         lse_ptr=per_split_lse,
         kv_len=kv_len,
-        head_dim=head_dim,
         gqa_size=gqa_size,
+        HEAD_DIM=head_dim,
     )
 
     grid_reduce = (
@@ -335,7 +335,7 @@ def flash_decode_autotune(
         split_lse_ptr=per_split_lse,
         o_ptr=o,
         split_num=split_num,
-        head_dim=head_dim,
+        HEAD_DIM=head_dim,
     )
 
 
