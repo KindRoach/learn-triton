@@ -19,6 +19,8 @@ def flash_decode_kernel_split(
     MAX_GQA_SIZE: tl.constexpr,
     BLOCK_KV: tl.constexpr,
 ):
+
+    # define Q/K/V descriptors
     batch_id = tl.program_id(0)
     kv_head_id = tl.program_id(1)
     kv_num_heads = tl.num_programs(1)
@@ -48,6 +50,12 @@ def flash_decode_kernel_split(
         block_shape=[BLOCK_KV, HEAD_DIM],
     )
 
+    # determine split range
+    split_id = tl.program_id(2)
+    split_num = tl.num_programs(2)
+    split_kv_start = split_id * (kv_len // split_num)
+    split_kv_end = tl.minimum(kv_len, (split_id + 1) * (kv_len // split_num))
+
     # Load all Q heads in the current GQA group as one block
     q_block = q_block_desc.load([0, 0])
 
@@ -56,8 +64,8 @@ def flash_decode_kernel_split(
     l_i = tl.zeros((MAX_GQA_SIZE, 1), dtype=tl.float32)
     o_block = tl.zeros((MAX_GQA_SIZE, HEAD_DIM), dtype=tl.float32)
 
-    # Iterate over K/V cache in blocks once
-    for kv_block_start in range(0, kv_len, BLOCK_KV):
+    # Iterate over K/V cache in blocks in split range
+    for kv_block_start in range(split_kv_start, split_kv_end, BLOCK_KV):
         k_tile = k_desc.load([kv_block_start, 0])
         v_tile = v_desc.load([kv_block_start, 0])
 
