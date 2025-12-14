@@ -3,6 +3,7 @@ import triton
 import triton.language as tl
 
 from ..utils import acc_check, bench_by_secs, enable_tma_allocator, get_device
+from .utils import attn_matmul_flops, attn_mem_access_bytes
 
 
 @triton.jit
@@ -219,6 +220,23 @@ def flash_attn_exp(
     v_tensor = torch.randn(batch_size, kv_num_heads, kv_len, head_dim, device=device, dtype=dtype)
     o_tensor = torch.empty_like(q_tensor)
 
+    mem_access_bytes = attn_mem_access_bytes(
+        batch_size=batch_size,
+        q_len=q_len,
+        kv_len=kv_len,
+        q_num_heads=q_num_heads,
+        kv_num_heads=kv_num_heads,
+        head_dim=head_dim,
+        dtype=dtype,
+    )
+    total_flops = attn_matmul_flops(
+        batch_size=batch_size,
+        q_len=q_len,
+        kv_len=kv_len,
+        q_num_heads=q_num_heads,
+        head_dim=head_dim,
+    )
+
     offset = kv_len - q_len
     q_idx = torch.arange(q_len, device=device)[:, None]  # [q_len, 1]
     k_idx = torch.arange(kv_len, device=device)[None, :]  # [1, kv_len]
@@ -245,6 +263,8 @@ def flash_attn_exp(
         bench_by_secs(
             10,
             lambda: func(q_tensor, k_tensor, v_tensor, o_tensor),
+            mem_access_bytes=mem_access_bytes,
+            total_flops=total_flops,
         )
         acc_check(excepted, o_tensor)
 
