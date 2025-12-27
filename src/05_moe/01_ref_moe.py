@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..utils import get_device
+from ..utils import acc_check, bench_by_secs, get_device
 
 
 class SwiGLU(nn.Module):
@@ -82,6 +82,37 @@ class MoELayer(nn.Module):
 
         return outputs.view(B, S, D)
 
+    def forward_expert_batching(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [batch, seq, d_model]
+        """
+        B, S, D = x.shape
+        x_flat = x.view(-1, D)  # [T, D], T = B*S
+
+        # ---- Routing ----
+        logits = self.router(x_flat)  # [T, E]
+        probs = F.softmax(logits, dim=-1)  # [T, E]
+        topk_probs, topk_idx = probs.topk(self.top_k, dim=-1)
+        # shapes: [T, K], [T, K]
+
+        # ---- Dispatch ----
+        output = torch.zeros_like(x_flat)
+
+        for k in range(self.top_k):
+            expert_ids = topk_idx[:, k]  # [T]
+            weights = topk_probs[:, k]  # [T]
+
+            for expert_id in range(self.num_experts):
+                mask = expert_ids == expert_id
+                if not mask.any():
+                    continue
+
+                tokens = x_flat[mask]  # [N, D]
+                expert_out = self.experts[expert_id](tokens)
+                output[mask] += expert_out * weights[mask].unsqueeze(-1)
+
+        return output.view(B, S, D)
+
 
 def main():
     batch_size = 1
@@ -94,10 +125,26 @@ def main():
     device = get_device()
     moe_layer = MoELayer(hidden_size, moe_intermediate_size, num_experts, top_k).to(device).eval()
     x = torch.randn(batch_size, token_num, hidden_size, device=device)
-    output = moe_layer(x)
 
-    print("Input shape:", x.shape)
-    print("Output shape:", output.shape)
+    # accuracy check
+    with torch.no_grad():
+        out_ref = moe_layer.forward(x)
+        out_opt = moe_layer.forward_expert_batching(x)
+        acc_check(out_ref, out_opt)
+
+    # perform benchmark
+    funcs_to_bench = {
+        moe_layer.forward.__name__: moe_layer.forward,
+        moe_layer.forward_expert_batching.__name__: moe_layer.forward_expert_batching,
+    }
+
+    sec = 10
+    for name, func in funcs_to_bench.items():
+        print(f"\nBenchmarking {name}...")
+        bench_by_secs(
+            sec,
+            lambda: func(x),
+        )
 
 
 if __name__ == "__main__":
