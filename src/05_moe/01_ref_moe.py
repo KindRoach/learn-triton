@@ -113,7 +113,7 @@ class MoELayer(nn.Module):
 
         return output.view(B, S, D)
 
-
+@torch.inference_mode()
 def main():
     batch_size = 1
     token_num = 8192
@@ -127,10 +127,9 @@ def main():
     x = torch.randn(batch_size, token_num, hidden_size, device=device)
 
     # accuracy check
-    with torch.no_grad():
-        out_ref = moe_layer.forward(x)
-        out_opt = moe_layer.forward_expert_batching(x)
-        acc_check(out_ref, out_opt)
+    out_ref = moe_layer.forward(x)
+    out_opt = moe_layer.forward_expert_batching(x)
+    acc_check(out_ref, out_opt)
 
     # perform benchmark
     funcs_to_bench = {
