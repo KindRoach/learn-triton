@@ -4,19 +4,13 @@ import torch.nn.functional as F
 from ..utils import acc_check, bench_by_secs, get_device
 
 
-def ref_batched_gemm(
+def ref_moe_gemm_explicit_group(
     x: torch.Tensor,  # [T, H] (regrouped by expert)
     expert_offsets: torch.Tensor,  # [E + 1]
     w_gate: torch.Tensor,  # [E, H, I]
     w_up: torch.Tensor,  # [E, H, I]
     w_down: torch.Tensor,  # [E, I, H]
 ) -> torch.Tensor:
-    """Operator-level reference aligned with vLLM Expert FFN.
-
-    This assumes `x` is already regrouped so that tokens for expert 0 come first,
-    then expert 1, ..., expert E-1.
-    `expert_offsets[e]:expert_offsets[e+1]` defines the token range for expert e.
-    """
 
     T, H = x.shape
     E = w_gate.shape[0]
@@ -42,17 +36,13 @@ def ref_batched_gemm(
     return out
 
 
-def ref_expert_ffn(
+def ref_moe_gemm_implicit_group(
     x: torch.Tensor,  # [T, H] (any order)
     expert_ids: torch.Tensor,  # [T]
     w_gate: torch.Tensor,  # [E, H, I]
     w_up: torch.Tensor,  # [E, H, I]
     w_down: torch.Tensor,  # [E, I, H]
 ) -> torch.Tensor:
-    """Reference implementation for arbitrary token order.
-
-    Mirrors the "expert batching" style from 01_ref_moe.py (mask by expert, run dense GEMMs).
-    """
 
     if expert_ids.ndim != 1 or expert_ids.numel() != x.shape[0]:
         raise ValueError("expert_ids must be 1D and match x.shape[0]")
@@ -109,14 +99,14 @@ def main():
     w_down = torch.randn((E, I, H), device=device, dtype=dtype) * init_scale
 
     # accuracy check
-    out_ref = ref_expert_ffn(x, expert_ids, w_gate, w_up, w_down)
-    out_batched = ref_batched_gemm(x, expert_offsets, w_gate, w_up, w_down)
-    acc_check(out_ref, out_batched)
+    out_implicit = ref_moe_gemm_implicit_group(x, expert_ids, w_gate, w_up, w_down)
+    out_explicit = ref_moe_gemm_explicit_group(x, expert_offsets, w_gate, w_up, w_down)
+    acc_check(out_implicit, out_explicit)
 
     # perform benchmark
     funcs_to_bench = {
-        ref_expert_ffn.__name__: lambda: ref_expert_ffn(x, expert_ids, w_gate, w_up, w_down),
-        ref_batched_gemm.__name__: lambda: ref_batched_gemm(x, expert_offsets, w_gate, w_up, w_down),
+        ref_moe_gemm_implicit_group.__name__: lambda: ref_moe_gemm_implicit_group(x, expert_ids, w_gate, w_up, w_down),
+        ref_moe_gemm_explicit_group.__name__: lambda: ref_moe_gemm_explicit_group(x, expert_offsets, w_gate, w_up, w_down),
     }
 
     sec = 10
