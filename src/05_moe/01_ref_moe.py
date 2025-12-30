@@ -57,12 +57,11 @@ class MoELayer(nn.Module):
         # ---- Flatten tokens ----
         tokens = x.view(T, D)  # {x_t}
 
-        # ---- Router: p_t = softmax(W_r x_t) ----
+        # ---- Router: compute logits, select Top-K, then softmax within Top-K ----
+        # This makes the selected expert weights sum to 1 for each token.
         router_logits = self.router(tokens)  # [T, E]
-        router_probs = F.softmax(router_logits, dim=-1)
-
-        # ---- Top-K selection ----
-        topk_weights, topk_experts = torch.topk(router_probs, self.top_k, dim=-1)  # both [T, K]
+        topk_logits, topk_experts = torch.topk(router_logits, self.top_k, dim=-1)  # both [T, K]
+        topk_weights = F.softmax(topk_logits, dim=-1)  # [T, K]
 
         # ---- MoE output initialization ----
         outputs = torch.zeros_like(tokens)  # y_t
@@ -89,11 +88,10 @@ class MoELayer(nn.Module):
         B, S, D = x.shape
         x_flat = x.view(-1, D)  # [T, D], T = B*S
 
-        # ---- Routing ----
+        # ---- Routing: Top-K on logits, softmax within Top-K ----
         logits = self.router(x_flat)  # [T, E]
-        probs = F.softmax(logits, dim=-1)  # [T, E]
-        topk_probs, topk_idx = probs.topk(self.top_k, dim=-1)
-        # shapes: [T, K], [T, K]
+        topk_logits, topk_idx = logits.topk(self.top_k, dim=-1)  # both [T, K]
+        topk_probs = F.softmax(topk_logits, dim=-1)  # [T, K]
 
         # ---- Dispatch ----
         output = torch.zeros_like(x_flat)
