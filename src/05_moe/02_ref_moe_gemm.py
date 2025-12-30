@@ -1,20 +1,19 @@
 import torch
 import torch.nn.functional as F
 
+from .utils import generate_moe_inputs, ref_topk_routing, ref_moe_scatter
 from ..utils import acc_check, bench_by_secs, get_device
 
 
 def ref_moe_gemm_explicit_group(
-    x: torch.Tensor,  # [T, H] (regrouped by expert)
+    x: torch.Tensor,  # [T * K, H] (regrouped by expert)
     expert_offsets: torch.Tensor,  # [E + 1]
     w_gate: torch.Tensor,  # [E, H, I]
     w_up: torch.Tensor,  # [E, H, I]
     w_down: torch.Tensor,  # [E, I, H]
-) -> torch.Tensor:
+) -> torch.Tensor:  # [T * K, H]
 
-    T, H = x.shape
     E = w_gate.shape[0]
-
     out = torch.empty_like(x)
 
     for e in range(E):
@@ -37,76 +36,84 @@ def ref_moe_gemm_explicit_group(
 
 
 def ref_moe_gemm_implicit_group(
-    x: torch.Tensor,  # [T, H] (any order)
-    expert_ids: torch.Tensor,  # [T]
+    x: torch.Tensor,  # [T, H]
+    expert_ids: torch.Tensor,  # [T, K] (any order)
     w_gate: torch.Tensor,  # [E, H, I]
     w_up: torch.Tensor,  # [E, H, I]
     w_down: torch.Tensor,  # [E, I, H]
-) -> torch.Tensor:
-
-    if expert_ids.ndim != 1 or expert_ids.numel() != x.shape[0]:
-        raise ValueError("expert_ids must be 1D and match x.shape[0]")
-
+) -> torch.Tensor:  # [T, K, H]
     T, H = x.shape
-    E = w_gate.shape[0]
-    out = torch.empty_like(x)
+    _, K = expert_ids.shape
 
-    for e in range(E):
-        mask = expert_ids == e
+    out = torch.empty(T, K, H, device=x.device, dtype=x.dtype)
+
+    for e in range(w_gate.shape[0]):
+        mask = expert_ids == e  # [T, K]
         if not mask.any():
             continue
 
-        x_e = x[mask]
-        gate = x_e @ w_gate[e]
-        up = x_e @ w_up[e]
-        act = F.silu(gate) * up
-        out[mask] = act @ w_down[e]
+        token_indices = mask.nonzero(as_tuple=False)  # [N_e, 2]
+        t_indices = token_indices[:, 0]  # [N_e]
+        k_indices = token_indices[:, 1]  # [N_e]
 
+        x_e = x[t_indices]  # [N_e, H]
+
+        gate = x_e @ w_gate[e]  # [N_e, I]
+        up = x_e @ w_up[e]  # [N_e, I]
+        act = F.silu(gate) * up  # [N_e, I]
+        y_e = act @ w_down[e]  # [N_e, H]
+
+        out[t_indices, k_indices] = y_e
+    
     return out
 
 
 @torch.inference_mode()
 def main():
     # Keep sizes modest by default so this runs on most GPUs.
-    T = 4096
+    T = 1024
     H = 2048
     I = 768
     E = 128
+    top_k = 8
 
     device = get_device()
     dtype = torch.float16
 
     # random number of tokens per expert with a logit-normal distribution
     torch.manual_seed(0)
-    logits = torch.randn((E,), device=device, dtype=torch.float32)
-    probs = torch.softmax(logits, dim=0)
-    num_tokens = torch.distributions.Multinomial(total_count=T, probs=probs).sample().to(torch.int64)
-    num_tokens[-1] += T - int(num_tokens.sum().item())
-
-    expert_offsets = torch.zeros((E + 1,), device=device, dtype=torch.int64)
-    expert_offsets[1:] = torch.cumsum(num_tokens, dim=0)
-
-    expert_ids = torch.repeat_interleave(
-        torch.arange(E, device=device, dtype=torch.int64),
-        num_tokens,
+    hiddens, logits, w_gate, w_up, w_down = generate_moe_inputs(
+        num_tokens=T,
+        num_experts=E,
+        hidden_dim=H,
+        internal_dim=I,
+        scale=0.1,
+        dtype=dtype,
+        device=device,
     )
 
-    # Use a smaller initialization scale so FP16 matmuls don't overflow to inf.
-    init_scale = 0.1
-    x = torch.randn((T, H), device=device, dtype=dtype) * init_scale
-    w_gate = torch.randn((E, H, I), device=device, dtype=dtype) * init_scale
-    w_up = torch.randn((E, H, I), device=device, dtype=dtype) * init_scale
-    w_down = torch.randn((E, I, H), device=device, dtype=dtype) * init_scale
+    topk_expert_ids, _ = ref_topk_routing(logits, top_k=top_k)
+
+    reordered_hiddens, reordered_index, expert_offsets = ref_moe_scatter(
+        hiddens=hiddens,
+        topk_expert_ids=topk_expert_ids,
+        num_experts=E,
+    )
 
     # accuracy check
-    out_implicit = ref_moe_gemm_implicit_group(x, expert_ids, w_gate, w_up, w_down)
-    out_explicit = ref_moe_gemm_explicit_group(x, expert_offsets, w_gate, w_up, w_down)
+    out_implicit = ref_moe_gemm_implicit_group(hiddens, topk_expert_ids.squeeze(1), w_gate, w_up, w_down)
+    out_explicit = ref_moe_gemm_explicit_group(reordered_hiddens, expert_offsets, w_gate, w_up, w_down)
+    out_explicit = out_explicit[reordered_index]
     acc_check(out_implicit, out_explicit)
 
     # perform benchmark
     funcs_to_bench = {
-        ref_moe_gemm_implicit_group.__name__: lambda: ref_moe_gemm_implicit_group(x, expert_ids, w_gate, w_up, w_down),
-        ref_moe_gemm_explicit_group.__name__: lambda: ref_moe_gemm_explicit_group(x, expert_offsets, w_gate, w_up, w_down),
+        ref_moe_gemm_implicit_group.__name__: lambda: ref_moe_gemm_implicit_group(
+            hiddens, topk_expert_ids.squeeze(1), w_gate, w_up, w_down
+        ),
+        ref_moe_gemm_explicit_group.__name__: lambda: ref_moe_gemm_explicit_group(
+            reordered_hiddens, expert_offsets, w_gate, w_up, w_down
+        ),
     }
 
     sec = 10
