@@ -11,7 +11,7 @@ def generate_moe_inputs(
     dtype: torch.dtype,
     scale: float,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     # uniformly random logits with some expert popularity bias
     expert_popularity = torch.rand(num_experts)
@@ -19,11 +19,10 @@ def generate_moe_inputs(
     logits = noise + expert_popularity.log()
 
     hiddens = torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype) * scale
-    w_gate = torch.randn(num_experts, hidden_dim, internal_dim, device=device, dtype=dtype) * scale
-    w_up = torch.randn(num_experts, hidden_dim, internal_dim, device=device, dtype=dtype) * scale
+    w_gate_up = torch.randn(num_experts, hidden_dim, internal_dim * 2, device=device, dtype=dtype) * scale
     w_down = torch.randn(num_experts, internal_dim, hidden_dim, device=device, dtype=dtype) * scale
 
-    return hiddens, logits, w_gate, w_up, w_down
+    return hiddens, logits, w_gate_up, w_down
 
 
 def ref_topk_routing(
@@ -85,7 +84,7 @@ def test_ref_moe_scatter():
     internal_dim = 512
     top_k = 8
 
-    hiddens, logits, _, _, _ = generate_moe_inputs(
+    hiddens, logits, _, _ = generate_moe_inputs(
         num_tokens=num_tokens,
         num_experts=num_experts,
         hidden_dim=hidden_dim,
