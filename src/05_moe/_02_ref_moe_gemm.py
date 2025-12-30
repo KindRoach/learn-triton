@@ -52,25 +52,24 @@ def ref_moe_gemm_implicit_group(
         if not mask.any():
             continue
 
-        token_indices = mask.nonzero(as_tuple=False)  # [N_e, 2]
-        t_indices = token_indices[:, 0]  # [N_e]
-        k_indices = token_indices[:, 1]  # [N_e]
+        token_idx = mask.nonzero(as_tuple=False)  # [N_e, 2]
+        t_idx = token_idx[:, 0]  # [N_e]
+        k_idx = token_idx[:, 1]  # [N_e]
 
-        x_e = x[t_indices]  # [N_e, H]
+        x_e = x[t_idx]  # [N_e, H]
 
-        gate = x_e @ w_gate[e]  # [N_e, I]
-        up = x_e @ w_up[e]  # [N_e, I]
-        act = F.silu(gate) * up  # [N_e, I]
-        y_e = act @ w_down[e]  # [N_e, H]
+        gate = x_e @ w_gate[e]
+        up = x_e @ w_up[e]
+        act = F.silu(gate) * up
+        y_e = act @ w_down[e]
 
-        out[t_indices, k_indices] = y_e
-    
+        out[t_idx, k_idx] = y_e  # [N_e, H]
+
     return out
 
 
 @torch.inference_mode()
 def main():
-    # Keep sizes modest by default so this runs on most GPUs.
     T = 1024
     H = 2048
     I = 768
