@@ -72,52 +72,110 @@ def moe_gemm_explicit_group_kernel(
     c_desc.store([0, tile_n], c_tile.to(c_desc.dtype))
 
 
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK_M": block_mn,
+                "BLOCK_N": block_mn,
+                "BLOCK_K": block_k,
+            },
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        for block_mn in [16, 32, 64, 128]
+        for block_k in [16, 32, 64, 128]
+        for num_stages in [1, 2, 3, 4]
+        for num_warps in [1, 2, 4, 8, 16, 32]
+    ],
+    key=["M", "N", "K"],
+    cache_results=True,
+)
+@triton.jit
+def moe_gemm_explicit_group_autotune_kernel(
+    x_ptr,  # [M, K] (regrouped by expert)
+    weight_ptr,  # [E, K, N]
+    out_ptr,  # [M, N]
+    expert_token_num_ptr,  # [E]
+    E: int,
+    M: int,
+    N: int,
+    K: int,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    moe_gemm_explicit_group_kernel(
+        x_ptr,
+        weight_ptr,
+        out_ptr,
+        expert_token_num_ptr,
+        E,
+        M,
+        N,
+        K,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+    )
+
+
 def triton_moe_gemm_explicit_group(
-    x: torch.Tensor,  # [T * top_k, H] (regrouped by expert)
+    x: torch.Tensor,  # [M, K] (regrouped by expert)
     expert_token_num: torch.Tensor,  # [E]
-    weight: torch.Tensor,  # [E, H, I*2]
+    weight: torch.Tensor,  # [E, K, N]
+    out: torch.Tensor,  # [M, N]
     block_m: int = 32,
     block_n: int = 32,
     block_k: int = 32,
-) -> torch.Tensor:  # [T * top_k, H]
+    auto_tune: bool = False,
+):
 
     M, K = x.shape
     E, _, N = weight.shape
 
-    # count number of blocks per expert and record expert ids
-    num_block_m = ((expert_token_num + block_m - 1) // block_m).sum().item()
+    def grid(meta):
+        # count number of blocks per expert and record expert ids
+        num_block_m = ((expert_token_num + meta["BLOCK_M"] - 1) // meta["BLOCK_M"]).sum().item()
+        grid = (num_block_m, triton.cdiv(N, meta["BLOCK_N"]))
+        return grid
 
-    # moe gemm [M, K] x [E, K, N] -> [M, N]
-    out = torch.empty(M, N, device=x.device, dtype=x.dtype)
-    grid = (num_block_m, triton.cdiv(N, block_n))
-    moe_gemm_explicit_group_kernel[grid](
-        x_ptr=x,
-        weight_ptr=weight,
-        out_ptr=out,
-        expert_token_num_ptr=expert_token_num,
-        E=E,
-        M=M,
-        N=N,
-        K=K,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
-    )
+    if auto_tune:
+        moe_gemm_explicit_group_autotune_kernel[grid](
+            x_ptr=x,
+            weight_ptr=weight,
+            out_ptr=out,
+            expert_token_num_ptr=expert_token_num,
+            E=E,
+            M=M,
+            N=N,
+            K=K,
+        )
+    else:
+        moe_gemm_explicit_group_kernel[grid](
+            x_ptr=x,
+            weight_ptr=weight,
+            out_ptr=out,
+            expert_token_num_ptr=expert_token_num,
+            E=E,
+            M=M,
+            N=N,
+            K=K,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+        )
 
     return out
 
 
 def ref_moe_gemm_explicit_group(
-    x: torch.Tensor,  # [T * top_k, H] (regrouped by expert)
+    x: torch.Tensor,  # [M, K] (regrouped by expert)
     expert_offsets: torch.Tensor,  # [E + 1]
-    weight: torch.Tensor,  # [E, H, I*2]
-) -> torch.Tensor:  # [T * top_k, H]
-
-    M, _ = x.shape
-    E, _, N = weight.shape
-
-    # moe gemm [M, K] x [E, K, N] -> [M, N]
-    out = torch.empty(M, N, device=x.device, dtype=x.dtype)
+    weight: torch.Tensor,  # [E, K, N]
+    out: torch.Tensor,  # [M, N]
+):
+    E, _, _ = weight.shape
 
     for e in range(E):
         start = int(expert_offsets[e].item())
@@ -144,7 +202,7 @@ def main():
 
     # random number of tokens per expert with a logit-normal distribution
     torch.manual_seed(0)
-    hiddens, logits, w_gate_up, w_down = generate_moe_inputs(
+    hiddens, logits, w_gate_up, _ = generate_moe_inputs(
         num_tokens=T,
         num_experts=E,
         hidden_dim=H,
@@ -162,18 +220,25 @@ def main():
         num_experts=E,
     )
 
-    # accuracy check
-    ref_out = ref_moe_gemm_explicit_group(reordered_hiddens, expert_token_offsets, w_gate_up)
-    out = triton_moe_gemm_explicit_group(reordered_hiddens, expert_token_num, w_gate_up)
-    acc_check(ref_out, out)
+    M, _ = reordered_hiddens.shape
+    E, _, N = w_gate_up.shape
+    # moe gemm [M, K] x [E, K, N] -> [M, N]
+    out_tensor = torch.empty(M, N, device=reordered_hiddens.device, dtype=reordered_hiddens.dtype)
+    ref_out = torch.empty_like(out_tensor)
+
+    ref_moe_gemm_explicit_group(reordered_hiddens, expert_token_offsets, w_gate_up, ref_out)
 
     # perform benchmark
     funcs_to_bench = {
         ref_moe_gemm_explicit_group.__name__: lambda: ref_moe_gemm_explicit_group(
-            reordered_hiddens, expert_token_offsets, w_gate_up
+            reordered_hiddens, expert_token_offsets, w_gate_up, out_tensor
         ),
         triton_moe_gemm_explicit_group.__name__: lambda: triton_moe_gemm_explicit_group(
-            reordered_hiddens, expert_token_num, w_gate_up
+            reordered_hiddens, expert_token_num, w_gate_up, out_tensor
+        ),
+        triton_moe_gemm_explicit_group.__name__
+        + "_autotune": lambda: triton_moe_gemm_explicit_group(
+            reordered_hiddens, expert_token_num, w_gate_up, out_tensor, auto_tune=True
         ),
     }
 
@@ -184,6 +249,7 @@ def main():
             sec,
             func,
         )
+        acc_check(ref_out, out_tensor)
 
 
 if __name__ == "__main__":
