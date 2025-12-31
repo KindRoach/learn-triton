@@ -90,7 +90,7 @@ def main():
 
     topk_expert_ids, _ = ref_topk_routing(logits, top_k=top_k)
 
-    reordered_hiddens, reordered_index, expert_offsets = ref_moe_scatter(
+    reordered_hiddens, reordered_index, _, expert_offsets = ref_moe_scatter(
         hiddens=hiddens,
         topk_expert_ids=topk_expert_ids,
         num_experts=E,

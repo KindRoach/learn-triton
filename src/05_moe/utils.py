@@ -14,8 +14,8 @@ def generate_moe_inputs(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     # uniformly random logits with some expert popularity bias
-    expert_popularity = torch.rand(num_experts)
-    noise = torch.randn(num_tokens, num_experts)
+    expert_popularity = torch.rand(num_experts, device=device, dtype=dtype)
+    noise = torch.randn(num_tokens, num_experts, device=device, dtype=dtype)
     logits = noise + expert_popularity.log()
 
     hiddens = torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype) * scale
@@ -38,7 +38,7 @@ def ref_moe_scatter(
     hiddens: torch.Tensor,  # [T, H]
     topk_expert_ids: torch.Tensor,  # [T, K]
     num_experts: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     T, H = hiddens.shape
     _, K = topk_expert_ids.shape
@@ -53,8 +53,8 @@ def ref_moe_scatter(
     # Flatten routing assignments.
     # - flatten_expert_ids: [T*K]
     # - original_token_ids: [T*K], maps each assignment back to its original token id
-    flatten_expert_ids = topk_expert_ids.reshape(-1).to(dtype=torch.int32)
-    original_token_ids = torch.arange(T, device=device, dtype=torch.int32).repeat_interleave(K)
+    flatten_expert_ids = topk_expert_ids.reshape(-1)
+    original_token_ids = torch.arange(T, device=device).repeat_interleave(K)
 
     # Stable sort by expert id so tokens for each expert are contiguous.
     _, sort_idx = torch.sort(flatten_expert_ids, stable=True)
@@ -69,12 +69,16 @@ def ref_moe_scatter(
     inv_sort_idx[sort_idx] = torch.arange(sort_idx.numel(), device=device, dtype=sort_idx.dtype)
     reordered_index = inv_sort_idx.reshape(T, K)
 
-    # Prefix-sum offsets into the reordered buffer per expert.
-    counts = torch.bincount(flatten_expert_ids, minlength=num_experts).to(dtype=torch.int32)
-    expert_offsets = torch.zeros((num_experts + 1,), device=device, dtype=torch.int32)
-    expert_offsets[1:] = torch.cumsum(counts, dim=0)
+    # Number of (token, top-k) assignments routed to each expert.
+    # Shape: [E]
+    expert_num_tokens = torch.bincount(flatten_expert_ids, minlength=num_experts).to(torch.int32)
 
-    return reordered_hiddens, reordered_index, expert_offsets
+    # Prefix-sum offsets into the reordered buffer per expert.
+    # Shape: [E + 1]
+    expert_token_offsets = torch.zeros((num_experts + 1,), device=device, dtype=torch.int32)
+    expert_token_offsets[1:] = torch.cumsum(expert_num_tokens, dim=0)
+
+    return reordered_hiddens, reordered_index, expert_num_tokens, expert_token_offsets
 
 
 def test_ref_moe_scatter():
@@ -96,11 +100,16 @@ def test_ref_moe_scatter():
 
     topk_expert_ids, _ = ref_topk_routing(logits, top_k=top_k)
 
-    reordered_hiddens, reordered_index, expert_offsets = ref_moe_scatter(
+    reordered_hiddens, reordered_index, expert_num_tokens, expert_token_offsets = ref_moe_scatter(
         hiddens=hiddens,
         topk_expert_ids=topk_expert_ids,
         num_experts=num_experts,
     )
+
+    assert expert_num_tokens.shape == (num_experts,)
+    assert expert_token_offsets.shape == (num_experts + 1,)
+    assert int(expert_num_tokens.sum().item()) == num_tokens * top_k
+    assert int(expert_token_offsets[-1].item()) == num_tokens * top_k
 
     original_hiddens = reordered_hiddens[reordered_index]
 
