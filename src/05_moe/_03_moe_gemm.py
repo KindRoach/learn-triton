@@ -15,8 +15,7 @@ def moe_gemm_explicit_group_kernel(
     weight_ptr,  # [E, K, N]
     out_ptr,  # [M, N]
     expert_offsets_ptr,  # [E + 1]
-    block_m_expert_ids_ptr,  # [num_blocks]
-    block_m_local_id_ptr,  # [num_blocks]
+    E: int,
     M: int,
     N: int,
     K: int,
@@ -27,11 +26,24 @@ def moe_gemm_explicit_group_kernel(
     block_m_id = tl.program_id(0)
     block_n_id = tl.program_id(1)
 
-    expert_id = tl.load(block_m_expert_ids_ptr + block_m_id)
-    local_id = tl.load(block_m_local_id_ptr + block_m_id)
-    row_start = tl.load(expert_offsets_ptr + expert_id)
-    row_end = tl.load(expert_offsets_ptr + expert_id + 1)
-    num_rows = row_end - row_start
+    # find expert id and row range for this block_m_id
+    expert_id = 0
+    row_start = 0
+    num_rows = 0
+    current_block_m_id = 0
+    local_block_m_id = 0
+    for e in range(E):
+        start = tl.load(expert_offsets_ptr + e)
+        end = tl.load(expert_offsets_ptr + e + 1)
+        rows = end - start
+        num_block_m = (rows + BLOCK_M - 1) // BLOCK_M
+        if current_block_m_id <= block_m_id and block_m_id < current_block_m_id + num_block_m:
+            expert_id = e
+            row_start = start
+            num_rows = rows
+            local_block_m_id = block_m_id - current_block_m_id
+
+        current_block_m_id += num_block_m
 
     a_desc = tl.make_tensor_descriptor(
         base=x_ptr + row_start * K,
@@ -47,7 +59,7 @@ def moe_gemm_explicit_group_kernel(
         block_shape=[BLOCK_K, BLOCK_N],
     )
 
-    tile_m = local_id * BLOCK_M
+    tile_m = local_block_m_id * BLOCK_M
     tile_n = block_n_id * BLOCK_N
     c_tile = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
@@ -83,19 +95,12 @@ def triton_moe_gemm_explicit_group(
     assert N1 // 2 == K2
 
     # count number of blocks per expert and record expert ids
-    block_m_expert_ids = []
-    block_m_local_ids = []
+    num_block_m = 0
     for e in range(E):
-        start = expert_offsets[e]
-        end = expert_offsets[e + 1]
+        start = expert_offsets[e].item()
+        end = expert_offsets[e + 1].item()
         num_rows = end - start
-        num_blocks = (num_rows + block_m - 1) // block_m
-        block_m_expert_ids.extend([e] * num_blocks)
-        block_m_local_ids.extend(list(range(num_blocks)))
-
-    num_block_m = len(block_m_expert_ids)
-    block_m_expert_ids = torch.tensor(block_m_expert_ids, device=x.device, dtype=torch.int32)
-    block_m_local_ids = torch.tensor(block_m_local_ids, device=x.device, dtype=torch.int32)
+        num_block_m += (num_rows + block_m - 1) // block_m
 
     # gaet_up gemm [M, K1] x [E, K1, N1] -> [M, N1]
     gate_up = torch.empty(M, N1, device=x.device, dtype=x.dtype)
@@ -105,8 +110,7 @@ def triton_moe_gemm_explicit_group(
         weight_ptr=w_gate_up,
         out_ptr=gate_up,
         expert_offsets_ptr=expert_offsets,
-        block_m_expert_ids_ptr=block_m_expert_ids,
-        block_m_local_id_ptr=block_m_local_ids,
+        E=E,
         M=M,
         N=N1,
         K=K1,
@@ -114,7 +118,7 @@ def triton_moe_gemm_explicit_group(
         BLOCK_N=block_n,
         BLOCK_K=block_k,
     )
-    
+
     # apply silu activation and element-wise multiplication
     I = N1 // 2
     gate_up = F.silu(gate_up[:, :I]) * gate_up[:, I:]
@@ -127,8 +131,7 @@ def triton_moe_gemm_explicit_group(
         weight_ptr=w_down,
         out_ptr=out,
         expert_offsets_ptr=expert_offsets,
-        block_m_expert_ids_ptr=block_m_expert_ids,
-        block_m_local_id_ptr=block_m_local_ids,
+        E=E,
         M=M,
         N=N2,
         K=I,
@@ -181,7 +184,6 @@ def main():
         ref_moe_gemm_explicit_group.__name__: lambda: ref_moe_gemm_explicit_group(
             reordered_hiddens, expert_offsets, w_gate_up, w_down
         ),
-
         triton_moe_gemm_explicit_group.__name__: lambda: triton_moe_gemm_explicit_group(
             reordered_hiddens, expert_offsets, w_gate_up, w_down
         ),
