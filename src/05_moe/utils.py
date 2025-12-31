@@ -53,8 +53,8 @@ def ref_moe_scatter(
     # Flatten routing assignments.
     # - flatten_expert_ids: [T*K]
     # - original_token_ids: [T*K], maps each assignment back to its original token id
-    flatten_expert_ids = topk_expert_ids.reshape(-1).to(dtype=torch.int64)
-    original_token_ids = torch.arange(T, device=device, dtype=torch.int64).repeat_interleave(K)
+    flatten_expert_ids = topk_expert_ids.reshape(-1).to(dtype=torch.int32)
+    original_token_ids = torch.arange(T, device=device, dtype=torch.int32).repeat_interleave(K)
 
     # Stable sort by expert id so tokens for each expert are contiguous.
     _, sort_idx = torch.sort(flatten_expert_ids, stable=True)
@@ -70,8 +70,8 @@ def ref_moe_scatter(
     reordered_index = inv_sort_idx.reshape(T, K)
 
     # Prefix-sum offsets into the reordered buffer per expert.
-    counts = torch.bincount(flatten_expert_ids, minlength=num_experts).to(dtype=torch.int64)
-    expert_offsets = torch.zeros((num_experts + 1,), device=device, dtype=torch.int64)
+    counts = torch.bincount(flatten_expert_ids, minlength=num_experts).to(dtype=torch.int32)
+    expert_offsets = torch.zeros((num_experts + 1,), device=device, dtype=torch.int32)
     expert_offsets[1:] = torch.cumsum(counts, dim=0)
 
     return reordered_hiddens, reordered_index, expert_offsets
@@ -186,8 +186,8 @@ def moe_align_block_size(
     padding_token_idx = total_assignments  # non-existing token id
     padding_expert_idx = num_experts  # non-existing expert id
 
-    block_token_ids = torch.full((max_num_tokens_padded,), padding_token_idx, dtype=torch.int64, device=device)
-    block_expert_ids = torch.full((max_num_blocks,), padding_expert_idx, dtype=torch.int64, device=device)
+    block_token_ids = torch.full((max_num_tokens_padded,), padding_token_idx, dtype=torch.int32, device=device)
+    block_expert_ids = torch.full((max_num_blocks,), padding_expert_idx, dtype=torch.int32, device=device)
 
     # actually pad to block size
     num_blocks = 0
@@ -222,7 +222,7 @@ def moe_align_block_size(
 def test_moe_align_block_size():
     topk_ids = torch.tensor(
         [[0, 1, 2], [0, 1, 2], [0, 1, 2], [0, 1, 2], [1, 2, 3]],
-        dtype=torch.int64,
+        dtype=torch.int32,
     )
     block_size = 4
     num_experts = 4
