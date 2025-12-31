@@ -143,7 +143,7 @@ def moe_align_block_size(
         sorted_flatten_expert_ids = [0, 0, 0, 0, 1, 1, 1, 1,  1,  2, 2, 2, 2,  2,  3]
         sorted_flatten_token_ids =  [0, 3, 6, 9, 1, 4, 7, 10, 12, 2, 5, 8, 11, 13, 14]
 
-    - Now pad each exprt tokens to block size:
+    - Now pad each expert tokens to block size:
         padded_expert_ids = [
             0, 0, 0, 0,
             1, 1, 1, 1,

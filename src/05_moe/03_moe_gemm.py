@@ -188,6 +188,27 @@ def ref_moe_gemm_explicit_group(
 
     return out
 
+def ref_moe_gemm_implicit_group(
+    x: torch.Tensor,  # [T, K] (regrouped by expert)
+    expert_ids: torch.Tensor,  # [T, K]
+    weight: torch.Tensor,  # [E, K, N]
+    out: torch.Tensor,  # [M, N]
+):
+    E, _, _ = weight.shape
+
+    for e in range(E):
+        mask = expert_ids == e  # [T, K]
+        if not mask.any():
+            continue
+
+        token_idx = mask.nonzero(as_tuple=False)  # [N_e, 2]
+        t_idx = token_idx[:, 0]  # [N_e]
+        k_idx = token_idx[:, 1]  # [N_e]
+
+        out[t_idx, k_idx] = x[t_idx] @ weight[e]  # [N_e, H]
+
+    return out
+
 
 @torch.inference_mode()
 def main():
@@ -214,7 +235,7 @@ def main():
 
     topk_expert_ids, _ = ref_topk_routing(logits, top_k=top_k)
 
-    reordered_hiddens, _, expert_token_num, expert_token_offsets = ref_moe_scatter(
+    reordered_hiddens, reordered_index, expert_token_num, expert_token_offsets = ref_moe_scatter(
         hiddens=hiddens,
         topk_expert_ids=topk_expert_ids,
         num_experts=E,
