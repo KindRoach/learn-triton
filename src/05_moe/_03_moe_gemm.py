@@ -1,12 +1,10 @@
 import torch
-import torch.nn.functional as F
 
 import triton
 from triton import language as tl
 
 from .utils import generate_moe_inputs, ref_topk_routing, ref_moe_scatter
 from ..utils import acc_check, bench_by_secs, get_device
-from ._02_ref_moe_gemm import ref_moe_gemm_explicit_group
 
 
 @triton.jit
@@ -77,55 +75,30 @@ def moe_gemm_explicit_group_kernel(
 def triton_moe_gemm_explicit_group(
     x: torch.Tensor,  # [T * top_k, H] (regrouped by expert)
     expert_token_num: torch.Tensor,  # [E]
-    w_gate_up: torch.Tensor,  # [E, H, I*2]
-    w_down: torch.Tensor,  # [E, I, H]
+    weight: torch.Tensor,  # [E, H, I*2]
     block_m: int = 32,
     block_n: int = 32,
     block_k: int = 32,
 ) -> torch.Tensor:  # [T * top_k, H]
 
-    M, K1 = x.shape
-    E, _, N1 = w_gate_up.shape
-    _, K2, N2 = w_down.shape
-
-    assert N1 // 2 == K2
+    M, K = x.shape
+    E, _, N = weight.shape
 
     # count number of blocks per expert and record expert ids
     num_block_m = ((expert_token_num + block_m - 1) // block_m).sum().item()
 
-    # gaet_up gemm [M, K1] x [E, K1, N1] -> [M, N1]
-    gate_up = torch.empty(M, N1, device=x.device, dtype=x.dtype)
-    grid = (num_block_m, triton.cdiv(N1, block_n))
+    # moe gemm [M, K] x [E, K, N] -> [M, N]
+    out = torch.empty(M, N, device=x.device, dtype=x.dtype)
+    grid = (num_block_m, triton.cdiv(N, block_n))
     moe_gemm_explicit_group_kernel[grid](
         x_ptr=x,
-        weight_ptr=w_gate_up,
-        out_ptr=gate_up,
-        expert_token_num_ptr=expert_token_num,
-        E=E,
-        M=M,
-        N=N1,
-        K=K1,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
-    )
-
-    # apply silu activation and element-wise multiplication
-    I = N1 // 2
-    gate_up = F.silu(gate_up[:, :I]) * gate_up[:, I:]
-
-    # down gemm [M, I] x [E, I, N2] -> [M, N2]
-    out = torch.empty(M, N2, device=x.device, dtype=x.dtype)
-    grid = (num_block_m, triton.cdiv(N2, block_n))
-    moe_gemm_explicit_group_kernel[grid](
-        x_ptr=gate_up,
-        weight_ptr=w_down,
+        weight_ptr=weight,
         out_ptr=out,
         expert_token_num_ptr=expert_token_num,
         E=E,
         M=M,
-        N=N2,
-        K=I,
+        N=N,
+        K=K,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
@@ -134,9 +107,33 @@ def triton_moe_gemm_explicit_group(
     return out
 
 
+def ref_moe_gemm_explicit_group(
+    x: torch.Tensor,  # [T * top_k, H] (regrouped by expert)
+    expert_offsets: torch.Tensor,  # [E + 1]
+    weight: torch.Tensor,  # [E, H, I*2]
+) -> torch.Tensor:  # [T * top_k, H]
+
+    M, _ = x.shape
+    E, _, N = weight.shape
+
+    # moe gemm [M, K] x [E, K, N] -> [M, N]
+    out = torch.empty(M, N, device=x.device, dtype=x.dtype)
+
+    for e in range(E):
+        start = int(expert_offsets[e].item())
+        end = int(expert_offsets[e + 1].item())
+
+        if start == end:
+            continue
+
+        out[start:end] = x[start:end] @ weight[e]
+
+    return out
+
+
 @torch.inference_mode()
 def main():
-    T = 1024
+    T = 8192
     H = 2048
     I = 768
     E = 128
@@ -166,17 +163,17 @@ def main():
     )
 
     # accuracy check
-    ref_out = ref_moe_gemm_explicit_group(reordered_hiddens, expert_token_offsets, w_gate_up, w_down)
-    out = triton_moe_gemm_explicit_group(reordered_hiddens, expert_token_num, w_gate_up, w_down)
+    ref_out = ref_moe_gemm_explicit_group(reordered_hiddens, expert_token_offsets, w_gate_up)
+    out = triton_moe_gemm_explicit_group(reordered_hiddens, expert_token_num, w_gate_up)
     acc_check(ref_out, out)
 
     # perform benchmark
     funcs_to_bench = {
         ref_moe_gemm_explicit_group.__name__: lambda: ref_moe_gemm_explicit_group(
-            reordered_hiddens, expert_token_offsets, w_gate_up, w_down
+            reordered_hiddens, expert_token_offsets, w_gate_up
         ),
         triton_moe_gemm_explicit_group.__name__: lambda: triton_moe_gemm_explicit_group(
-            reordered_hiddens, expert_token_num, w_gate_up, w_down
+            reordered_hiddens, expert_token_num, w_gate_up
         ),
     }
 
