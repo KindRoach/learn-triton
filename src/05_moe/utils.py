@@ -120,6 +120,31 @@ def test_ref_moe_scatter():
     print(f"{test_ref_moe_scatter.__name__}: OK")
 
 
+def ref_sort_token_ids_by_expert(
+    expert_ids: torch.Tensor,  # [T, K],
+) -> torch.Tensor:  # [T*K, ]
+    """
+    Return token ids sorted by expert.
+
+    Example:
+    Given topk_ids = [[0, 1, 2], [0, 1, 2], [0, 1, 2], [0, 1, 2], [1, 2, 3]]:
+
+    - First, get flatten token_ids and expert_ids as
+        flatten_expert_ids = [0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1,  2,  1,  2,  3]
+        flatten_token_ids  = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        original_token_ids = [0 ,0, 0, 1, 1, 1, 2, 2, 2, 3, 3,  3,  4,  4,  4]
+        Note: original_token_ids = flatten_token_ids // K
+
+    - Then sorting by expert index, we obtain
+        sorted_expert_ids = [0, 0, 0, 0, 1, 1, 1, 1,  1,  2, 2, 2, 2,  2,  3]
+        sorted_token_ids =  [0, 3, 6, 9, 1, 4, 7, 10, 12, 2, 5, 8, 11, 13, 14]
+    """
+
+    flatten_expert_ids = expert_ids.reshape(-1)
+    _, sorted_token_ids = torch.sort(flatten_expert_ids, stable=True)
+    return sorted_token_ids
+
+
 def moe_align_block_size(
     topk_ids: torch.Tensor,  # [T, K]
     block_size: int,

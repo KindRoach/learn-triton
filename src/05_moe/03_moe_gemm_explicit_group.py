@@ -3,7 +3,7 @@ import torch
 import triton
 from triton import language as tl
 
-from .utils import generate_moe_inputs, ref_topk_routing, ref_moe_scatter
+from .utils import generate_moe_inputs, ref_sort_token_ids_by_expert, ref_topk_routing, ref_moe_scatter
 from ..utils import acc_check, bench_by_secs, get_device
 
 
@@ -166,8 +166,6 @@ def triton_moe_gemm_explicit_group(
             BLOCK_K=block_k,
         )
 
-    return out
-
 
 def ref_moe_gemm_explicit_group(
     x: torch.Tensor,  # [M, K] (regrouped by expert)
@@ -185,29 +183,6 @@ def ref_moe_gemm_explicit_group(
             continue
 
         out[start:end] = x[start:end] @ weight[e]
-
-    return out
-
-def ref_moe_gemm_implicit_group(
-    x: torch.Tensor,  # [T, K] (regrouped by expert)
-    expert_ids: torch.Tensor,  # [T, K]
-    weight: torch.Tensor,  # [E, K, N]
-    out: torch.Tensor,  # [M, N]
-):
-    E, _, _ = weight.shape
-
-    for e in range(E):
-        mask = expert_ids == e  # [T, K]
-        if not mask.any():
-            continue
-
-        token_idx = mask.nonzero(as_tuple=False)  # [N_e, 2]
-        t_idx = token_idx[:, 0]  # [N_e]
-        k_idx = token_idx[:, 1]  # [N_e]
-
-        out[t_idx, k_idx] = x[t_idx] @ weight[e]  # [N_e, H]
-
-    return out
 
 
 @torch.inference_mode()
@@ -235,14 +210,14 @@ def main():
 
     topk_expert_ids, _ = ref_topk_routing(logits, top_k=top_k)
 
-    reordered_hiddens, reordered_index, expert_token_num, expert_token_offsets = ref_moe_scatter(
+    reordered_hiddens, _, expert_token_num, expert_token_offsets = ref_moe_scatter(
         hiddens=hiddens,
         topk_expert_ids=topk_expert_ids,
         num_experts=E,
     )
 
     M, _ = reordered_hiddens.shape
-    E, _, N = w_gate_up.shape
+    _, _, N = w_gate_up.shape
     # moe gemm [M, K] x [E, K, N] -> [M, N]
     out_tensor = torch.empty(M, N, device=reordered_hiddens.device, dtype=reordered_hiddens.dtype)
     ref_out = torch.empty_like(out_tensor)
