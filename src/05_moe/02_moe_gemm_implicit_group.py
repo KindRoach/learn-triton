@@ -86,15 +86,70 @@ def moe_gemm_implicit_group_kernel(
     )
 
 
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK_M": block_mn,
+                "BLOCK_N": block_mn,
+                "BLOCK_K": block_k,
+            },
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        for block_mn in [16, 32, 64, 128]
+        for block_k in [16, 32, 64, 128]
+        for num_stages in [1, 2, 3, 4]
+        for num_warps in [1, 2, 4, 8, 16, 32]
+    ],
+    key=["M", "N", "K"],
+    cache_results=True,
+)
+@triton.jit
+def moe_gemm_implicit_group_autotune_kernel(
+    x_ptr,  # [T, K]
+    weight_ptr,  # [E, K, N]
+    out_ptr,  # [T, top_k, N]
+    expert_token_num_ptr,  # [E]
+    sorted_token_ids_ptr,  # [M = T * top_k, N]
+    E: int,
+    T: int,
+    M: int,
+    N: int,
+    K: int,
+    top_k: int,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    moe_gemm_implicit_group_kernel(
+        x_ptr,
+        weight_ptr,
+        out_ptr,
+        expert_token_num_ptr,
+        sorted_token_ids_ptr,
+        E,
+        T,
+        M,
+        N,
+        K,
+        top_k,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+    )
+
+
 def triton_moe_gemm_implicit_group(
     x: torch.Tensor,  # [T, K]
     weight: torch.Tensor,  # [E, K, N]
     out: torch.Tensor,  # [T, top_k, N]
     expert_token_num: torch.Tensor,  # [E]
     sorted_token_ids: torch.Tensor,  # [M = T * top_k, N]
-    block_m: int = 64,
-    block_n: int = 64,
+    block_m: int = 32,
+    block_n: int = 32,
     block_k: int = 32,
+    auto_tune: bool = False,
 ):
 
     T, K = x.shape
@@ -107,22 +162,37 @@ def triton_moe_gemm_implicit_group(
         grid = (num_block_m, triton.cdiv(N, meta["BLOCK_N"]))
         return grid
 
-    moe_gemm_implicit_group_kernel[grid](
-        x_ptr=x,
-        weight_ptr=weight,
-        out_ptr=out,
-        expert_token_num_ptr=expert_token_num,
-        sorted_token_ids_ptr=sorted_token_ids,
-        E=E,
-        T=T,
-        M=T * top_k,
-        N=N,
-        K=K,
-        top_k=top_k,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
-    )
+    if auto_tune:
+        moe_gemm_implicit_group_autotune_kernel[grid](
+            x_ptr=x,
+            weight_ptr=weight,
+            out_ptr=out,
+            expert_token_num_ptr=expert_token_num,
+            sorted_token_ids_ptr=sorted_token_ids,
+            E=E,
+            T=T,
+            M=T * top_k,
+            N=N,
+            K=K,
+            top_k=top_k,
+        )
+    else:
+        moe_gemm_implicit_group_kernel[grid](
+            x_ptr=x,
+            weight_ptr=weight,
+            out_ptr=out,
+            expert_token_num_ptr=expert_token_num,
+            sorted_token_ids_ptr=sorted_token_ids,
+            E=E,
+            T=T,
+            M=T * top_k,
+            N=N,
+            K=K,
+            top_k=top_k,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+        )
 
 
 def ref_moe_gemm_implicit_group(
@@ -190,6 +260,10 @@ def main():
         ),
         triton_moe_gemm_implicit_group.__name__: lambda: triton_moe_gemm_implicit_group(
             hiddens, w_gate_up, out_tensor, expert_token_num, sorted_token_ids, block_m=64, block_n=64, block_k=32
+        ),
+        triton_moe_gemm_implicit_group.__name__
+        + "_autotune": lambda: triton_moe_gemm_implicit_group(
+            hiddens, w_gate_up, out_tensor, expert_token_num, sorted_token_ids, auto_tune=True
         ),
     }
 

@@ -3,7 +3,7 @@ import torch
 import triton
 from triton import language as tl
 
-from .utils import generate_moe_inputs, ref_sort_token_ids_by_expert, ref_topk_routing, ref_moe_scatter
+from .utils import generate_moe_inputs, ref_topk_routing, ref_moe_scatter
 from ..utils import acc_check, bench_by_secs, get_device
 
 
