@@ -19,19 +19,19 @@ def ref_moe_token_centric(
     I = I2 // 2
 
     for t in range(T):
-        # gate up
-        w_gate_up_selected = w_gate_up[expert_ids[t]]  # [K, H, 2*I]
-        gate_up = hiddens[t].unsqueeze(0) @ w_gate_up_selected  # [K, 2*I]
+        # gate up: [K, 1, H] @ [K, H, 2*I] = [K, 1, 2*I]
+        w_gate_up_selected = w_gate_up[expert_ids[t]]
+        gate_up = hiddens[t, None, :] @ w_gate_up_selected
 
         # silu activation
         gate_up = F.silu(gate_up[:, :, :I]) * gate_up[:, :, I:]  # [K, 1, I]
 
-        # down
+        # down: [K, 1, I] @ [K, I, H] = [K, 1, H]
         w_down_selected = w_down[expert_ids[t]]  # [K, I, H]
         down = gate_up @ w_down_selected  # [K, 1, H]
 
-        # gather
-        out[t, :] = expert_weights[t] @ down.squeeze(1)  # [H]
+        # gather: [1, K] @ [K, H] = [1, H]
+        out[t, :] = expert_weights[None, t] @ down.squeeze(1)
 
 
 @torch.inference_mode()
