@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 import triton
 from triton import language as tl
@@ -11,8 +12,8 @@ from ..utils import acc_check, bench_by_secs, get_device
 def moe_gemm_explicit_group_kernel(
     x_ptr,  # [M, K] (regrouped by expert)
     weight_ptr,  # [E, K, N]
-    out_ptr,  # [M, N]
     expert_token_num_ptr,  # [E]
+    out_ptr,  # [M, N]
     E: int,
     M: int,
     N: int,
@@ -95,8 +96,8 @@ def moe_gemm_explicit_group_kernel(
 def moe_gemm_explicit_group_autotune_kernel(
     x_ptr,  # [M, K] (regrouped by expert)
     weight_ptr,  # [E, K, N]
-    out_ptr,  # [M, N]
     expert_token_num_ptr,  # [E]
+    out_ptr,  # [M, N]
     E: int,
     M: int,
     N: int,
@@ -108,8 +109,8 @@ def moe_gemm_explicit_group_autotune_kernel(
     moe_gemm_explicit_group_kernel(
         x_ptr,
         weight_ptr,
-        out_ptr,
         expert_token_num_ptr,
+        out_ptr,
         E,
         M,
         N,
@@ -122,8 +123,8 @@ def moe_gemm_explicit_group_autotune_kernel(
 
 def triton_moe_gemm_explicit_group(
     x: torch.Tensor,  # [M, K] (regrouped by expert)
-    expert_token_num: torch.Tensor,  # [E]
     weight: torch.Tensor,  # [E, K, N]
+    expert_token_num: torch.Tensor,  # [E]
     out: torch.Tensor,  # [M, N]
     block_m: int = 32,
     block_n: int = 32,
@@ -144,8 +145,8 @@ def triton_moe_gemm_explicit_group(
         moe_gemm_explicit_group_autotune_kernel[grid](
             x_ptr=x,
             weight_ptr=weight,
-            out_ptr=out,
             expert_token_num_ptr=expert_token_num,
+            out_ptr=out,
             E=E,
             M=M,
             N=N,
@@ -155,8 +156,8 @@ def triton_moe_gemm_explicit_group(
         moe_gemm_explicit_group_kernel[grid](
             x_ptr=x,
             weight_ptr=weight,
-            out_ptr=out,
             expert_token_num_ptr=expert_token_num,
+            out_ptr=out,
             E=E,
             M=M,
             N=N,
@@ -169,8 +170,8 @@ def triton_moe_gemm_explicit_group(
 
 def ref_moe_gemm_explicit_group(
     x: torch.Tensor,  # [M, K] (regrouped by expert)
-    expert_offsets: torch.Tensor,  # [E + 1]
     weight: torch.Tensor,  # [E, K, N]
+    expert_offsets: torch.Tensor,  # [E + 1]
     out: torch.Tensor,  # [M, N]
 ):
     E, _, _ = weight.shape
@@ -198,7 +199,7 @@ def main():
 
     # random number of tokens per expert with a logit-normal distribution
     torch.manual_seed(0)
-    hiddens, logits, w_gate_up, _ = generate_moe_inputs(
+    hiddens, logits, w_gate_up, w_down = generate_moe_inputs(
         num_tokens=T,
         num_experts=E,
         hidden_dim=H,
@@ -210,42 +211,73 @@ def main():
 
     topk_expert_ids, _ = ref_topk_routing(logits, top_k=top_k)
 
-    reordered_hiddens, _, expert_token_num, expert_token_offsets = ref_moe_scatter(
+    gate_up_reordered_hiddens, _, expert_token_num, expert_token_offsets = ref_moe_scatter(
         hiddens=hiddens,
         topk_expert_ids=topk_expert_ids,
         num_experts=E,
     )
 
-    M, _ = reordered_hiddens.shape
-    _, _, N = w_gate_up.shape
-    # moe gemm [M, K] x [E, K, N] -> [M, N]
-    out_tensor = torch.empty(M, N, device=reordered_hiddens.device, dtype=reordered_hiddens.dtype)
-    ref_out = torch.empty_like(out_tensor)
+    M, _ = gate_up_reordered_hiddens.shape
+    _, _, N1 = w_gate_up.shape
+    _, _, N2 = w_down.shape
+    gate_up_out = torch.empty(M, N1, device=hiddens.device, dtype=hiddens.dtype)
+    down_out = torch.empty(M, N2, device=hiddens.device, dtype=hiddens.dtype)
 
-    ref_moe_gemm_explicit_group(reordered_hiddens, expert_token_offsets, w_gate_up, ref_out)
+    # ref gate_up gemm
+    ref_gate_up_out = torch.empty_like(gate_up_out)
+    ref_moe_gemm_explicit_group(gate_up_reordered_hiddens, w_gate_up, expert_token_offsets, ref_gate_up_out)
+
+    # ref down gemm
+    ref_down_out = torch.empty_like(down_out)
+    down_reordered_hiddens = (F.silu(gate_up_out)[:, :I] * gate_up_out[:, I:]).reshape(M, I)
+    ref_moe_gemm_explicit_group(down_reordered_hiddens, w_down, expert_token_offsets, ref_down_out)
 
     # perform benchmark
+    sec = 10
+
+    print("============ Gate Up GEMM ============")
     funcs_to_bench = {
         ref_moe_gemm_explicit_group.__name__: lambda: ref_moe_gemm_explicit_group(
-            reordered_hiddens, expert_token_offsets, w_gate_up, out_tensor
+            gate_up_reordered_hiddens, w_gate_up, expert_token_offsets, gate_up_out
         ),
         triton_moe_gemm_explicit_group.__name__: lambda: triton_moe_gemm_explicit_group(
-            reordered_hiddens, expert_token_num, w_gate_up, out_tensor
+            gate_up_reordered_hiddens, w_gate_up, expert_token_num, gate_up_out
         ),
         triton_moe_gemm_explicit_group.__name__
         + "_autotune": lambda: triton_moe_gemm_explicit_group(
-            reordered_hiddens, expert_token_num, w_gate_up, out_tensor, auto_tune=True
+            gate_up_reordered_hiddens, w_gate_up, expert_token_num, gate_up_out, auto_tune=True
         ),
     }
 
-    sec = 10
     for name, func in funcs_to_bench.items():
         print(f"\nBenchmarking {name}...")
         bench_by_secs(
             sec,
             func,
         )
-        acc_check(ref_out, out_tensor)
+        acc_check(ref_gate_up_out, gate_up_out)
+
+    print("\n============ Down GEMM ============")
+    funcs_to_bench = {
+        ref_moe_gemm_explicit_group.__name__: lambda: ref_moe_gemm_explicit_group(
+            down_reordered_hiddens, w_down, expert_token_offsets, down_out
+        ),
+        triton_moe_gemm_explicit_group.__name__: lambda: triton_moe_gemm_explicit_group(
+            down_reordered_hiddens, w_down, expert_token_num, down_out
+        ),
+        triton_moe_gemm_explicit_group.__name__
+        + "_autotune": lambda: triton_moe_gemm_explicit_group(
+            down_reordered_hiddens, w_down, expert_token_num, down_out, auto_tune=True
+        ),
+    }
+
+    for name, func in funcs_to_bench.items():
+        print(f"\nBenchmarking {name}...")
+        bench_by_secs(
+            sec,
+            func,
+        )
+        acc_check(ref_down_out, down_out)
 
 
 if __name__ == "__main__":

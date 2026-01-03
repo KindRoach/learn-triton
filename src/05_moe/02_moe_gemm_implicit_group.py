@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 import triton
 from triton import language as tl
@@ -9,9 +10,9 @@ from ..utils import acc_check, bench_by_secs, get_device
 
 @triton.jit
 def moe_gemm_implicit_group_kernel(
+    out_ptr,  # [T, top_k, N]
     x_ptr,  # [T, K]
     weight_ptr,  # [E, K, N]
-    out_ptr,  # [T, top_k, N]
     expert_token_num_ptr,  # [E]
     sorted_token_ids_ptr,  # [M = T * top_k, N]
     E: int,
@@ -107,9 +108,9 @@ def moe_gemm_implicit_group_kernel(
 )
 @triton.jit
 def moe_gemm_implicit_group_autotune_kernel(
+    out_ptr,  # [T, top_k, N]
     x_ptr,  # [T, K]
     weight_ptr,  # [E, K, N]
-    out_ptr,  # [T, top_k, N]
     expert_token_num_ptr,  # [E]
     sorted_token_ids_ptr,  # [M = T * top_k, N]
     E: int,
@@ -123,9 +124,9 @@ def moe_gemm_implicit_group_autotune_kernel(
     BLOCK_K: tl.constexpr,
 ):
     moe_gemm_implicit_group_kernel(
+        out_ptr,
         x_ptr,
         weight_ptr,
-        out_ptr,
         expert_token_num_ptr,
         sorted_token_ids_ptr,
         E,
@@ -141,11 +142,12 @@ def moe_gemm_implicit_group_autotune_kernel(
 
 
 def triton_moe_gemm_implicit_group(
-    x: torch.Tensor,  # [T, K]
-    weight: torch.Tensor,  # [E, K, N]
     out: torch.Tensor,  # [T, top_k, N]
+    x: torch.Tensor,  # [T, K] for gate_up, [T*top_k, K] for down
+    weight: torch.Tensor,  # [E, K, N]
     expert_token_num: torch.Tensor,  # [E]
-    sorted_token_ids: torch.Tensor,  # [M = T * top_k, N]
+    sorted_token_ids: torch.Tensor,  # [T*top_k]
+    is_gate_up: bool,  # True for gate_up, False for down
     block_m: int = 32,
     block_n: int = 32,
     block_k: int = 32,
@@ -174,7 +176,7 @@ def triton_moe_gemm_implicit_group(
             M=T * top_k,
             N=N,
             K=K,
-            top_k=top_k,
+            top_k=top_k if is_gate_up else 1,
         )
     else:
         moe_gemm_implicit_group_kernel[grid](
@@ -188,7 +190,7 @@ def triton_moe_gemm_implicit_group(
             M=T * top_k,
             N=N,
             K=K,
-            top_k=top_k,
+            top_k=top_k if is_gate_up else 1,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_K=block_k,
@@ -196,23 +198,35 @@ def triton_moe_gemm_implicit_group(
 
 
 def ref_moe_gemm_implicit_group(
-    x: torch.Tensor,  # [T, K]
-    weight: torch.Tensor,  # [E, K, N]
     out: torch.Tensor,  # [T, top_k, N]
-    expert_ids: torch.Tensor,  # [T, top_k]
+    x: torch.Tensor,  # [T, K] for gate_up, [T*top_k, K] for down
+    weight: torch.Tensor,  # [E, K, N]
+    expert_token_num: torch.Tensor,  # [E]
+    sorted_token_ids: torch.Tensor,  # [T*top_k]
+    is_gate_up: bool,  # True for gate_up, False for down
 ):
+    T, top_k, N = out.shape
     E, _, _ = weight.shape
+    k_size = top_k if is_gate_up else 1
 
+    out = out.view(T * top_k, N)  # [T*top_k, N]
+
+    row_start = 0
     for e in range(E):
-        mask = expert_ids == e  # [T, top_k]
-        if not mask.any():
+        num_rows = expert_token_num[e].item()
+
+        # skip if no tokens for this expert
+        if num_rows == 0:
             continue
 
-        token_idx = mask.nonzero(as_tuple=False)  # [N_e, 2]
-        t_idx = token_idx[:, 0]  # [N_e]
-        k_idx = token_idx[:, 1]  # [N_e]
+        # gather x and weight, perform gemm
+        token_ids = sorted_token_ids[row_start : row_start + num_rows]  # [rows,]
+        x_e = x[token_ids // k_size, :]  # [rows, K]
+        w_e = weight[e, :, :]  # [K, N]
+        out[token_ids, :] = x_e @ w_e  # [rows, N]
 
-        out[t_idx, k_idx] = x[t_idx] @ weight[e]  # [N_e, H]
+        # update row start
+        row_start += num_rows
 
 
 @torch.inference_mode()
@@ -228,7 +242,7 @@ def main():
 
     # random number of tokens per expert with a logit-normal distribution
     torch.manual_seed(0)
-    hiddens, logits, w_gate_up, _ = generate_moe_inputs(
+    hiddens, logits, w_gate_up, w_down = generate_moe_inputs(
         num_tokens=T,
         num_experts=E,
         hidden_dim=H,
@@ -246,35 +260,108 @@ def main():
         num_experts=E,
     )
 
-    _, _, N = w_gate_up.shape
-    # moe gemm [T, K] x [E, K, N] -> [T, top_k, N]
-    out_tensor = torch.empty(T, top_k, N, device=hiddens.device, dtype=hiddens.dtype)
-    ref_out = torch.empty_like(out_tensor)
+    _, _, N1 = w_gate_up.shape
+    _, _, N2 = w_down.shape
+    gate_up_out = torch.empty(T, top_k, N1, device=hiddens.device, dtype=hiddens.dtype)
+    down_out = torch.empty(T, top_k, N2, device=hiddens.device, dtype=hiddens.dtype)
 
-    ref_moe_gemm_implicit_group(hiddens, w_gate_up, ref_out, topk_expert_ids)
+    # ref gate_up gemm
+    ref_gate_up_out = torch.empty_like(gate_up_out)
+    ref_moe_gemm_implicit_group(
+        ref_gate_up_out, hiddens, w_gate_up, expert_token_num, sorted_token_ids, is_gate_up=True
+    )
+
+    # ref down gemm
+    ref_down_out = torch.empty_like(down_out)
+    down_hiddens = (F.silu(gate_up_out)[:, :, :I] * gate_up_out[:, :, I:]).reshape(T * top_k, I)
+    ref_moe_gemm_implicit_group(
+        ref_down_out, down_hiddens, w_down, expert_token_num, sorted_token_ids, is_gate_up=False
+    )
 
     # perform benchmark
+    sec = 10
+
+    print("============ Gate Up GEMM ============")
     funcs_to_bench = {
         ref_moe_gemm_implicit_group.__name__: lambda: ref_moe_gemm_implicit_group(
-            hiddens, w_gate_up, out_tensor, topk_expert_ids
+            gate_up_out,
+            hiddens,
+            w_gate_up,
+            expert_token_num,
+            sorted_token_ids,
+            is_gate_up=True,
         ),
         triton_moe_gemm_implicit_group.__name__: lambda: triton_moe_gemm_implicit_group(
-            hiddens, w_gate_up, out_tensor, expert_token_num, sorted_token_ids, block_m=64, block_n=64, block_k=32
+            gate_up_out,
+            hiddens,
+            w_gate_up,
+            expert_token_num,
+            sorted_token_ids,
+            is_gate_up=True,
+            block_m=64,
+            block_n=64,
+            block_k=32,
         ),
         triton_moe_gemm_implicit_group.__name__
         + "_autotune": lambda: triton_moe_gemm_implicit_group(
-            hiddens, w_gate_up, out_tensor, expert_token_num, sorted_token_ids, auto_tune=True
+            gate_up_out,
+            hiddens,
+            w_gate_up,
+            expert_token_num,
+            sorted_token_ids,
+            is_gate_up=True,
+            auto_tune=True,
         ),
     }
 
-    sec = 10
     for name, func in funcs_to_bench.items():
         print(f"\nBenchmarking {name}...")
         bench_by_secs(
             sec,
             func,
         )
-        acc_check(ref_out, out_tensor)
+        acc_check(ref_gate_up_out, gate_up_out)
+
+    print("\n============ Down GEMM ============")
+    funcs_to_bench = {
+        ref_moe_gemm_implicit_group.__name__: lambda: ref_moe_gemm_implicit_group(
+            down_out,
+            down_hiddens,
+            w_down,
+            expert_token_num,
+            sorted_token_ids,
+            is_gate_up=False,
+        ),
+        triton_moe_gemm_implicit_group.__name__: lambda: triton_moe_gemm_implicit_group(
+            down_out,
+            down_hiddens,
+            w_down,
+            expert_token_num,
+            sorted_token_ids,
+            is_gate_up=False,
+            block_m=64,
+            block_n=64,
+            block_k=32,
+        ),
+        triton_moe_gemm_implicit_group.__name__
+        + "_autotune": lambda: triton_moe_gemm_implicit_group(
+            down_out,
+            down_hiddens,
+            w_down,
+            expert_token_num,
+            sorted_token_ids,
+            is_gate_up=False,
+            auto_tune=True,
+        ),
+    }
+
+    for name, func in funcs_to_bench.items():
+        print(f"\nBenchmarking {name}...")
+        bench_by_secs(
+            sec,
+            func,
+        )
+        acc_check(ref_down_out, down_out)
 
 
 if __name__ == "__main__":
