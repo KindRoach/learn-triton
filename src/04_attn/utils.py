@@ -2,7 +2,6 @@ import torch
 
 
 def attn_mem_access_bytes(
-    *,
     batch_size: int,
     q_len: int,
     kv_len: int,
@@ -26,7 +25,6 @@ def attn_mem_access_bytes(
 
 
 def attn_matmul_flops(
-    *,
     batch_size: int,
     q_len: int,
     kv_len: int,
@@ -42,3 +40,30 @@ def attn_matmul_flops(
     Using mul+add = 2 FLOPs, total is 4 * B * Hq * q_len * kv_len * d.
     """
     return int(4 * batch_size * q_num_heads * q_len * kv_len * head_dim)
+
+
+def ref_attn_prefill(
+    q_tensor: torch.Tensor,
+    k_tensor: torch.Tensor,
+    v_tensor: torch.Tensor,
+    o_tensor: torch.Tensor,
+) -> None:
+    device = q_tensor.device
+    batch_size, q_num_heads, q_len, _ = q_tensor.shape
+    _, _, kv_len, _ = k_tensor.shape
+
+    offset = kv_len - q_len
+    q_idx = torch.arange(q_len, device=device)[:, None]  # [q_len, 1]
+    k_idx = torch.arange(kv_len, device=device)[None, :]  # [1, kv_len]
+    causal = k_idx <= (q_idx + offset)  # [q_len, kv_len]
+    attn_mask = causal.view(1, 1, q_len, kv_len)  # [1,1,q_len,kv_len]
+    attn_mask = attn_mask.expand(batch_size, q_num_heads, -1, -1)  # [B,H,q_len,kv_len]
+
+    o_tensor[:] = torch.nn.functional.scaled_dot_product_attention(
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        attn_mask=attn_mask,
+        is_causal=False,  # we provide the mask explicitly
+        enable_gqa=True,  # keep if q/k heads differ by an integer factor
+    )

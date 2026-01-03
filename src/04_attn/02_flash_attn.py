@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 
 from ..utils import acc_check, bench_by_secs, enable_tma_allocator, get_device
-from .utils import attn_matmul_flops, attn_mem_access_bytes
+from .utils import attn_matmul_flops, attn_mem_access_bytes, ref_attn_prefill
 
 
 @triton.jit
@@ -104,13 +104,9 @@ def flash_attn_kernel(
                 "BLOCK_Q": block_q,
                 "BLOCK_KV": block_kv,
             },
-            num_warps=num_warps,
-            num_stages=num_stages,
         )
         for block_q in [16, 32, 64]
         for block_kv in [16, 32, 64]
-        for num_warps in [1, 2, 4, 8, 16]
-        for num_stages in [1, 2, 3]
     ],
     key=["HEAD_DIM"],
     cache_results=True,
@@ -219,6 +215,7 @@ def flash_attn_exp(
     k_tensor = torch.randn(batch_size, kv_num_heads, kv_len, head_dim, device=device, dtype=dtype)
     v_tensor = torch.randn(batch_size, kv_num_heads, kv_len, head_dim, device=device, dtype=dtype)
     o_tensor = torch.empty_like(q_tensor)
+    excepted = torch.empty_like(q_tensor)
 
     mem_access_bytes = attn_mem_access_bytes(
         batch_size=batch_size,
@@ -237,21 +234,8 @@ def flash_attn_exp(
         head_dim=head_dim,
     )
 
-    offset = kv_len - q_len
-    q_idx = torch.arange(q_len, device=device)[:, None]  # [q_len, 1]
-    k_idx = torch.arange(kv_len, device=device)[None, :]  # [1, kv_len]
-    causal = k_idx <= (q_idx + offset)  # [q_len, kv_len]
-    attn_mask = causal.view(1, 1, q_len, kv_len)  # [1,1,q_len,kv_len]
-    attn_mask = attn_mask.expand(batch_size, q_num_heads, -1, -1)  # [B,H,q_len,kv_len]
-
-    excepted = torch.nn.functional.scaled_dot_product_attention(
-        q_tensor,
-        k_tensor,
-        v_tensor,
-        attn_mask=attn_mask,
-        is_causal=False,  # we provide the mask explicitly
-        enable_gqa=True,  # keep if q/k heads differ by an integer factor
-    )
+    # reference implementation
+    ref_attn_prefill(q_tensor, k_tensor, v_tensor, excepted)
 
     funcs_to_bench = {
         flash_attn.__name__: flash_attn,
@@ -273,7 +257,7 @@ if __name__ == "__main__":
     enable_tma_allocator()
     flash_attn_exp(
         batch_size=1,
-        q_len=4 * 1024,
+        q_len=1 * 1024,
         kv_len=16 * 1024,
         q_num_heads=28,
         kv_num_heads=4,
