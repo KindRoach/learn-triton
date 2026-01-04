@@ -273,7 +273,7 @@ def main():
 
     # ref down gemm
     ref_down_out = torch.empty_like(down_out)
-    down_hiddens = (F.silu(gate_up_out)[:, :, :I] * gate_up_out[:, :, I:]).reshape(T * top_k, I)
+    down_hiddens = (F.silu(ref_gate_up_out)[:, :, :I] * ref_gate_up_out[:, :, I:]).reshape(T * top_k, I)
     ref_moe_gemm_implicit_group(
         ref_down_out, down_hiddens, w_down, expert_token_num, sorted_token_ids, is_gate_up=False
     )

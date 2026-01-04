@@ -229,7 +229,7 @@ def main():
 
     # ref down gemm
     ref_down_out = torch.empty_like(down_out)
-    down_reordered_hiddens = (F.silu(gate_up_out)[:, :I] * gate_up_out[:, I:]).reshape(M, I)
+    down_reordered_hiddens = (F.silu(ref_gate_up_out)[:, :I] * ref_gate_up_out[:, I:]).reshape(M, I)
     ref_moe_gemm_explicit_group(down_reordered_hiddens, w_down, expert_token_offsets, ref_down_out)
 
     # perform benchmark
