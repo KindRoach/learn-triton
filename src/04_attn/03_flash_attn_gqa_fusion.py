@@ -59,13 +59,6 @@ def flash_attn_gqa_fusion_kernel(
     l_i = tl.zeros((MAX_GQA_SIZE, BLOCK_Q, 1), dtype=tl.float32)
     o_acc = tl.zeros((MAX_GQA_SIZE, BLOCK_Q, HEAD_DIM), dtype=tl.float32)
 
-    gqa_heads = tl.arange(0, MAX_GQA_SIZE)
-    gqa_mask = gqa_heads < gqa_size
-
-    # causal mask is shared across GQA heads
-    kv_offsets = tl.arange(0, BLOCK_KV)[None, :]
-    q_offsets = tl.arange(0, BLOCK_Q)[:, None]
-
     inv_sqrt_d = 1.0 / (HEAD_DIM**0.5)
 
     # one pass over the KV history; reuse each kv tile for all gqa heads
@@ -78,12 +71,14 @@ def flash_attn_gqa_fusion_kernel(
         scores = tl.reshape(scores2d, (MAX_GQA_SIZE, BLOCK_Q, BLOCK_KV))
 
         # apply causal mask
-        kv_pos = (kv_block_start + kv_offsets)[None, :, :]
-        q_pos = (q_block_start + (kv_len - q_len) + q_offsets)[None, :, :]
+        kv_pos = (kv_block_start + tl.arange(0, BLOCK_KV))[None, None, :]
+        q_pos = (q_block_start + kv_len - q_len + tl.arange(0, BLOCK_Q))[None, :, None]
         causal_mask = kv_pos <= q_pos
         scores = tl.where(causal_mask, scores, float("-inf"))
 
-        # mask inactive heads (when gqa_size < MAX_GQA_SIZE)
+        # apply gqa mask
+        gqa_heads = tl.arange(0, MAX_GQA_SIZE)
+        gqa_mask = gqa_heads < gqa_size
         scores = tl.where(gqa_mask[:, None, None], scores, float("-inf"))
 
         # compute softmax and output
@@ -160,7 +155,6 @@ def flash_attn_gqa_fusion(
     k_tensor: torch.Tensor,
     v_tensor: torch.Tensor,
     o_tensor: torch.Tensor,
-    *,
     block_q: int = 32,
     block_kv: int = 32,
     max_gqa_size: int = 8,
@@ -263,7 +257,7 @@ def flash_attn_gqa_fusion_exp(
 
     # reference implementation
     ref_attn_prefill(q_tensor, k_tensor, v_tensor, excepted)
-    
+
     funcs_to_bench = {
         flash_attn_gqa_fusion.__name__: flash_attn_gqa_fusion,
         flash_attn_gqa_fusion_autotune.__name__: flash_attn_gqa_fusion_autotune,
