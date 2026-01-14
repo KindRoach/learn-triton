@@ -122,6 +122,55 @@ def flash_attn_paged_gqa_kernel(
     o_desc.store([q_block_id * BLOCK_Q, 0, 0], o_out.to(o_desc.dtype))
 
 
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK_Q": block_q,
+            },
+        )
+        for block_q in [4, 8, 16, 32, 64]
+    ],
+    key=["BLOCK_SIZE", "HEAD_DIM", "MAX_GQA"],
+    cache_results=True,
+)
+@triton.jit
+def flash_attn_paged_gqa_autotune_kernel(
+    q_ptr,  # pointer to Q: [total_q_len, q_num_heads, head_dim] -> [total_q_len, kv_num_heads, gqa_size, head_dim]
+    k_ptr,  # pointer to K: [block_num, block_size, kv_num_heads, head_dim]
+    v_ptr,  # pointer to V: [block_num, block_size, kv_num_heads, head_dim]
+    o_ptr,  # pointer to O: [total_q_len, q_num_heads, head_dim]
+    cu_seqlens_q_ptr,  # pointer to cu_seqlens_q: [num_seqs + 1]
+    seqused_kv_ptr,  # pointer to seqused_kv: [num_seqs]
+    block_table_ptr,  # pointer to block_table: [num_seqs, max_num_blocks]
+    block_num: int,
+    q_num_heads: int,
+    kv_num_heads: int,
+    max_num_blocks: int,
+    BLOCK_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    MAX_GQA: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+):
+    flash_attn_paged_gqa_kernel(
+        q_ptr=q_ptr,
+        k_ptr=k_ptr,
+        v_ptr=v_ptr,
+        o_ptr=o_ptr,
+        cu_seqlens_q_ptr=cu_seqlens_q_ptr,
+        seqused_kv_ptr=seqused_kv_ptr,
+        block_table_ptr=block_table_ptr,
+        block_num=block_num,
+        q_num_heads=q_num_heads,
+        kv_num_heads=kv_num_heads,
+        max_num_blocks=max_num_blocks,
+        BLOCK_SIZE=BLOCK_SIZE,
+        HEAD_DIM=HEAD_DIM,
+        MAX_GQA=MAX_GQA,
+        BLOCK_Q=BLOCK_Q,
+    )
+
+
 def triton_flash_attn_paged(
     q: torch.Tensor,  # [total_q_len, q_num_heads, head_dim]
     k: torch.Tensor,  # [block_num, block_size, kv_num_heads, head_dim]
@@ -131,12 +180,18 @@ def triton_flash_attn_paged(
     max_seqlen_q: int,
     seqused_kv: torch.Tensor,  # [num_seqs]
     block_table: torch.Tensor,  # [num_seqs, max_num_blocks]
-    max_gqa: int = 8,
     block_q: int = 32,
+    autotune: bool = False,
 ):
     _, q_num_heads, head_dim = q.shape
     block_num, block_size, kv_num_heads, _ = k.shape
     num_seqs, max_num_blocks = block_table.shape
+
+    # set max_gqa to the smallest power of 2 that is >= actual gqa size
+    max_gqa = 1
+    gqa_size = q_num_heads // kv_num_heads
+    while max_gqa < gqa_size:
+        max_gqa *= 2
 
     grid = lambda meta: (
         num_seqs,
@@ -144,23 +199,41 @@ def triton_flash_attn_paged(
         triton.cdiv(max_seqlen_q, meta["BLOCK_Q"]),
     )
 
-    flash_attn_paged_gqa_kernel[grid](
-        q_ptr=q,
-        k_ptr=k,
-        v_ptr=v,
-        o_ptr=o,
-        cu_seqlens_q_ptr=cu_seqlens_q,
-        seqused_kv_ptr=seqused_kv,
-        block_table_ptr=block_table,
-        block_num=block_num,
-        q_num_heads=q_num_heads,
-        kv_num_heads=kv_num_heads,
-        max_num_blocks=max_num_blocks,
-        BLOCK_SIZE=block_size,
-        HEAD_DIM=head_dim,
-        MAX_GQA=max_gqa,
-        BLOCK_Q=block_q,
-    )
+    if autotune:
+        flash_attn_paged_gqa_autotune_kernel[grid](
+            q_ptr=q,
+            k_ptr=k,
+            v_ptr=v,
+            o_ptr=o,
+            cu_seqlens_q_ptr=cu_seqlens_q,
+            seqused_kv_ptr=seqused_kv,
+            block_table_ptr=block_table,
+            block_num=block_num,
+            q_num_heads=q_num_heads,
+            kv_num_heads=kv_num_heads,
+            max_num_blocks=max_num_blocks,
+            BLOCK_SIZE=block_size,
+            HEAD_DIM=head_dim,
+            MAX_GQA=max_gqa,
+        )
+    else:
+        flash_attn_paged_gqa_kernel[grid](
+            q_ptr=q,
+            k_ptr=k,
+            v_ptr=v,
+            o_ptr=o,
+            cu_seqlens_q_ptr=cu_seqlens_q,
+            seqused_kv_ptr=seqused_kv,
+            block_table_ptr=block_table,
+            block_num=block_num,
+            q_num_heads=q_num_heads,
+            kv_num_heads=kv_num_heads,
+            max_num_blocks=max_num_blocks,
+            BLOCK_SIZE=block_size,
+            HEAD_DIM=head_dim,
+            MAX_GQA=max_gqa,
+            BLOCK_Q=block_q,
+        )
 
 
 def ref_flash_attn_paged(
@@ -185,7 +258,7 @@ def ref_flash_attn_paged(
     assert block_table.ndim == 2
 
     device = q.device
-    total_q_len, q_num_heads, head_dim = q.shape
+    _, q_num_heads, head_dim = q.shape
     block_num, block_size, kv_num_heads, head_dim_kv = k.shape
     assert head_dim_kv == head_dim
     assert cu_seqlens_q.shape[0] == seqused_kv.shape[0] + 1
@@ -288,7 +361,6 @@ def generate_random_tensors():
 
     num_used_blocks = (kv_len + block_size - 1) // block_size
     seqused_kv = torch.full((num_seqs,), kv_len, device=device, dtype=torch.int32)
-    max_seqlen_kv = kv_len
 
     block_table = torch.empty((num_seqs, num_used_blocks), device=device, dtype=torch.int32)
     for seq_id in range(num_seqs):
@@ -301,7 +373,6 @@ def generate_random_tensors():
         cu_seqlens_q,
         max_seqlen_q,
         seqused_kv,
-        max_seqlen_kv,
         block_table,
     )
 
@@ -315,7 +386,6 @@ def main():
         cu_seqlens_q,
         max_seqlen_q,
         seqused_kv,
-        max_seqlen_kv,
         block_table,
     ) = generate_random_tensors()
     o = torch.empty_like(q)
@@ -342,6 +412,19 @@ def main():
             max_seqlen_q,
             seqused_kv,
             block_table,
+            block_q=32,
+        ),
+        triton_flash_attn_paged.__name__
+        + "_autotune": lambda: triton_flash_attn_paged(
+            q,
+            k,
+            v,
+            o,
+            cu_seqlens_q,
+            max_seqlen_q,
+            seqused_kv,
+            block_table,
+            autotune=True,
         ),
     }
 
