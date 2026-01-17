@@ -1,0 +1,11 @@
+{
+    "name": "learn-triton Dev Container (XPU-WSL)",
+    "build": {
+        "dockerfile": "./Dockerfile"
+    },
+    "runArgs": [
+        "--device=/dev/dgx",
+        "-v=/usr/lib/wsl:/usr/lib/wsl",
+        "--privileged"
+    ]
+}
