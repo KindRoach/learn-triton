@@ -43,7 +43,7 @@ def matrix_multiply_kernel(
     for k in range(0, K, BLOCK_K):
         a_tile = a_desc.load([tile_m, k])
         b_tile = b_desc.load([k, tile_n])
-        c_tile += tl.dot(a_tile, b_tile)
+        c_tile += tl.dot(a_tile, b_tile).to(c_tile.dtype)
 
     c_desc.store([tile_m, tile_n], c_tile)
 
@@ -154,7 +154,7 @@ def main():
     K = 4096
 
     device = get_device()
-    dtype = torch.float32
+    dtype = torch.float16
 
     a_tensor = torch.randn((M, K), dtype=dtype, device=device)
     b_tensor = torch.randn((K, N), dtype=dtype, device=device)
