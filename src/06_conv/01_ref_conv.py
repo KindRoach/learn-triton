@@ -1,32 +1,7 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
-from ..utils import acc_check, bench_by_secs, enable_tma_allocator, get_device
-
-
-def conv2d_with_builtin(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    stride: int = 1,
-    padding: int = 0,
-) -> torch.Tensor:
-    """
-    Reference implementation of 2D convolution using PyTorch's built-in Conv2D.
-    This is not optimized for performance and serves as a correctness reference.
-
-    Args:
-        input: [N, C_in, H_in, W_in]
-        weight: [C_out, C_in, K_h, K_w]
-        bias: [C_out]
-        stride: Stride of the convolution
-        padding: Zero-padding added to both sides of the input
-    Returns:
-        output: [N, C_out, H_out, W_out]
-    """
-
-    return F.conv2d(input, weight, bias, stride=stride, padding=padding)
+from ..utils import acc_check, bench_by_secs, get_device
 
 
 def conv2d_reference(
@@ -82,6 +57,54 @@ def conv2d_reference(
     return output
 
 
+def conv2d_im2col_gemm_builtin(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    output: torch.Tensor,
+    stride: int = 1,
+    padding: int = 0,
+):
+    """
+    Reference implementation of 2D convolution using im2col + GEMM approach with PyTorch's built-in functions.
+    This is not optimized for performance and serves as a correctness reference.
+
+    Args:
+        input: [N, C_in, H_in, W_in]
+        weight: [C_out, C_in, K_h, K_w]
+        bias: [C_out]
+        stride: Stride of the convolution
+        padding: Zero-padding added to both sides of the input
+    Returns:
+        output: [N, C_out, H_out, W_out]
+    """
+    N, C_in, H_in, W_in = input.shape
+    C_out, _, K_h, K_w = weight.shape
+
+    # Compute output dimensions
+    H_out = (H_in + 2 * padding - K_h) // stride + 1
+    W_out = (W_in + 2 * padding - K_w) // stride + 1
+
+    # Pad the input
+    if padding > 0:
+        input_padded = F.pad(input, (padding, padding, padding, padding))
+    else:
+        input_padded = input
+
+    # im2col: unfold the input into patches
+    input_unfolded = F.unfold(input_padded, kernel_size=(K_h, K_w), stride=stride)  # [N, C_in*K_h*K_w, H_out*W_out]
+
+    # reshape weight for matrix multiplication
+    weight_reshaped = weight.view(C_out, -1)  # [C_out, C_in*K_h*K_w]
+
+    # matmul and add bias
+    output_unfolded = weight_reshaped @ input_unfolded + bias.view(-1, 1)  # [N, C_out, H_out*W_out]
+
+    # reshape to original shape
+    output.copy_(output_unfolded.view(N, C_out, H_out, W_out))  # [N, C_out, H_out, W_out]
+
+
+@torch.inference_mode()
 def main():
     # Example usage
     N, C_in, H_in, W_in = 2, 3, 192, 256
@@ -100,10 +123,11 @@ def main():
     bias = torch.randn(C_out, device=device, dtype=dtype)
     output = torch.empty(N, C_out, H_out, W_out, device=device, dtype=dtype)
 
-    expected = conv2d_with_builtin(input, weight, bias, stride=stride, padding=padding)
+    expected = F.conv2d(input, weight, bias, stride=stride, padding=padding)
 
     funcs_to_check = {
         "conv2d_reference": conv2d_reference,
+        "conv2d_im2col_gemm_builtin": conv2d_im2col_gemm_builtin,
     }
 
     mem_access_bytes = input.element_size() * (input.numel() + weight.numel() + bias.numel() + output.numel())
