@@ -7,5 +7,7 @@
         "--device=/dev/dgx",
         "-v=/usr/lib/wsl:/usr/lib/wsl",
         "--privileged"
-    ]
+    ],
+    "remoteUser": "ubuntu",
+    "updateRemoteUserUID": true
 }

@@ -6,5 +6,7 @@
     "runArgs": [
         "--device=/dev/dri",
         "--privileged"
-    ]
+    ],
+    "remoteUser": "ubuntu",
+    "updateRemoteUserUID": true
 }

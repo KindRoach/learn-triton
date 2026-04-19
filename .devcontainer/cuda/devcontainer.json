@@ -6,5 +6,7 @@
     "runArgs": [
         "--runtime=nvidia",
         "--gpus=all"
-    ]
+    ],
+    "remoteUser": "ubuntu",
+    "updateRemoteUserUID": true
 }

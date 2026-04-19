@@ -23,9 +23,14 @@ RUN apt-get install -y python3 python3-pip python-is-python3
 # Install Pytorch with XPU support
 RUN rm -f /usr/lib/python3.12/EXTERNALLY-MANAGED
 RUN pip install \
-    torch==2.9.1 \
+    torch==2.11.0 \
     --index-url https://download.pytorch.org/whl/xpu
 
 # Install other pip libs
 RUN pip install \
     numpy
+
+# config user and bash completion
+RUN apt-get update && apt-get install -y sudo bash-completion \
+    && echo "ubuntu ALL=(root) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu \
+    && chmod 0440 /etc/sudoers.d/ubuntu
