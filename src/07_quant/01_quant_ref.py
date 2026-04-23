@@ -7,32 +7,41 @@ from ..utils import acc_check
 # Quantization Functions (FP32 -> INT8)
 # ============================================================================
 
-def quantize_per_channel(T: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+def quantize_per_channel(T: torch.Tensor) -> tuple:
     """
     Quantize tensor from FP32 to INT8 with per-channel scaling.
+    Scales are calculated as max(abs(T)) / 128 per channel (INT8 range: [-128, 127]).
+    For weights (N, K): one scale per output channel (per row).
     
     Args:
-        T: Input tensor (M, K) in FP32
-        scales: Per-channel scales (K,)
+        T: Input tensor (N, K) in FP32
     
     Returns:
-        T_q: Quantized tensor (M, K) in INT8
+        T_q: Quantized tensor (N, K) in INT8
+        scales: Per-channel scales (N,)
     """
-    return torch.round(T / scales.view(-1, 1)).to(torch.int8)
+    # Calculate per-channel scales: max(abs()) per row / 128 (INT8 range)
+    scales = torch.max(torch.abs(T), dim=1)[0] / 128.0
+    T_q = torch.round(T / scales.view(-1, 1)).to(torch.int8)
+    return T_q, scales
 
 
-def quantize_per_tensor(T: torch.Tensor, scale: float) -> torch.Tensor:
+def quantize_per_tensor(T: torch.Tensor) -> tuple:
     """
     Quantize tensor from FP32 to INT8 with global scaling.
+    Scale is calculated as max(abs(T)) / 128 (INT8 range: [-128, 127]).
     
     Args:
         T: Input tensor (M, K) in FP32
-        scale: Global scale (scalar)
     
     Returns:
         T_q: Quantized tensor (M, K) in INT8
+        scale: Global scale (scalar)
     """
-    return torch.round(T / scale).to(torch.int8)
+    # Calculate global scale: max(abs()) / 128 (INT8 range)
+    scale = torch.max(torch.abs(T)).item() / 128.0
+    T_q = torch.round(T / scale).to(torch.int8)
+    return T_q, scale
 
 
 # ============================================================================
@@ -139,25 +148,21 @@ def main():
 
     # --- Test per-tensor quantized GEMM ---
     print("\n--- Per-Tensor Quantized GEMM ---")
-    w_scale = 0.1
-    x_scale = 0.1
 
-    # Quantize inputs
-    X_q_pt = quantize_per_tensor(X, x_scale)
-    W_q_pt = quantize_per_tensor(W, w_scale)
-    
+    # Quantize inputs (scale is calculated as max(abs(x))/128)
+    X_q_pt, x_scale = quantize_per_tensor(X)
+    W_q_pt, w_scale = quantize_per_tensor(W)
+
     # Compute quantized output
     Y_quant_pt = per_tensor_quant_gemm(X_q_pt, W_q_pt, w_scale, x_scale)
     acc_check(Y_fp32, Y_quant_pt)
 
     # --- Test per-channel quantized GEMM (vectorized) ---
-    print("--- Per-Channel Quantized GEMM (vectorized) ---")
-    w_scales = torch.tensor([0.1, 0.2, 0.3, 0.4])
-    x_scale = 0.1
+    print("\n--- Per-Channel Quantized GEMM (vectorized) ---")
 
-    # Quantize inputs
-    X_q_pc = quantize_per_tensor(X, x_scale)
-    W_q_pc = quantize_per_channel(W, w_scales)
+    # Quantize inputs (scales are calculated as max(abs()) per channel / 128)
+    X_q_pc, x_scale = quantize_per_tensor(X)
+    W_q_pc, w_scales = quantize_per_channel(W)
     
     # Compute quantized output
     Y_quant_pc = per_channel_quant_gemm(X_q_pc, W_q_pc, w_scales, x_scale)
@@ -167,11 +172,6 @@ def main():
     print("\n--- Per-Channel Quantized GEMM (scalar loops) ---")
     Y_quant_pc_scalar = per_channel_quant_gemm_scalar(X_q_pc, W_q_pc, w_scales, x_scale)
     acc_check(Y_fp32, Y_quant_pc_scalar)
-    
-    # Verify vectorized and scalar implementations match
-    print("\n--- Verify vectorized vs scalar implementation ---")
-    print(f"Max difference: {torch.max(torch.abs(Y_quant_pc - Y_quant_pc_scalar)).item():.6e}")
-
 
 
 if __name__ == "__main__":
