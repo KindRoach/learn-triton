@@ -12,8 +12,7 @@ def per_tensor_quant_gemm_kernel(
     x_ptr,
     w_ptr,
     o_ptr,
-    scale_x_ptr,
-    scale_w_ptr,
+    scale_ptr,
     M: int,
     N: int,
     K: int,
@@ -40,25 +39,25 @@ def per_tensor_quant_gemm_kernel(
         strides=[N, 1],
         block_shape=[BLOCK_M, BLOCK_N],
     )
-    
+
     # Get current block position
     tile_m = tl.program_id(0) * BLOCK_M
     tile_n = tl.program_id(1) * BLOCK_N
-    
+
     # Initialize accumulator in int32
     c_tile = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int32)
-    
+
     # Main loop over K dimension
     for k in range(0, K, BLOCK_K):
         # Load quantized tiles
         x_tile = x_desc.load([tile_m, k])  # (BLOCK_M, BLOCK_K) in int8
         w_tile = w_desc.load([tile_n, k])  # (BLOCK_N, BLOCK_K) in int8
-        
+
         # Matrix multiply: x @ w.T
         c_tile += tl.dot(x_tile, tl.trans(w_tile)).to(tl.int32)
 
     # Dequantize c to fp32
-    scale = tl.load(scale_x_ptr) * tl.load(scale_w_ptr)
+    scale = tl.load(scale_ptr)
     c_tile = c_tile.to(tl.float32) * scale
 
     # Store result as float32
@@ -86,12 +85,12 @@ def per_tensor_quant_gemm(
         triton.cdiv(N, BLOCK_N),
     )
 
+    scale = x_scale * w_scale
     per_tensor_quant_gemm_kernel[grid](
         x,
         w,
         o,
-        x_scale,
-        w_scale,
+        scale,
         M,
         N,
         K,

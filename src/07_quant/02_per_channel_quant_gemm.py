@@ -11,8 +11,7 @@ def per_channel_quant_gemm_kernel(
     x_ptr,
     w_ptr,
     o_ptr,
-    x_scale_ptr,
-    w_scales_ptr,
+    scales_ptr,
     M: int,
     N: int,
     K: int,
@@ -39,8 +38,8 @@ def per_channel_quant_gemm_kernel(
         strides=[N, 1],
         block_shape=[BLOCK_M, BLOCK_N],
     )
-    w_scales_desc = tl.make_tensor_descriptor(
-        base=w_scales_ptr,
+    scales_desc = tl.make_tensor_descriptor(
+        base=scales_ptr,
         shape=[N],
         strides=[1],
         block_shape=[BLOCK_N],
@@ -62,10 +61,9 @@ def per_channel_quant_gemm_kernel(
         # Matrix multiply: x @ w.T
         c_tile += tl.dot(x_tile, tl.trans(w_tile)).to(tl.int32)
 
-    # Dequantize c to fp32. Weight scales are per output channel (N).
-    w_scales = w_scales_desc.load([tile_n])
-    scale = tl.load(x_scale_ptr) * w_scales
-    c_tile = c_tile.to(tl.float32) * scale[None, :]
+    # Dequantize c to fp32. Scales are per output channel (N).
+    scales = scales_desc.load([tile_n])
+    c_tile = c_tile.to(tl.float32) * scales[None, :]
 
     # Store result as float32
     o_desc.store([tile_m, tile_n], c_tile)
@@ -93,12 +91,12 @@ def per_channel_quant_gemm(
         triton.cdiv(N, BLOCK_N),
     )
 
+    scales = x_scale * w_scales
     per_channel_quant_gemm_kernel[grid](
         x,
         w,
         o,
-        x_scale,
-        w_scales,
+        scales,
         M,
         N,
         K,
