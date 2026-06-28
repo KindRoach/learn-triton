@@ -69,6 +69,66 @@ def per_channel_quant_gemm_kernel(
     o_desc.store([tile_m, tile_n], c_tile)
 
 
+@triton.jit
+def per_channel_quant_gemm_swapAB_kernel(
+    x_ptr,
+    w_ptr,
+    o_ptr,
+    scales_ptr,
+    M: int,
+    N: int,
+    K: int,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Tensor descriptors for input and output tensors
+    x_desc = tl.make_tensor_descriptor(
+        base=x_ptr,
+        shape=[M, K],
+        strides=[K, 1],
+        block_shape=[BLOCK_M, BLOCK_K],
+    )
+    w_desc = tl.make_tensor_descriptor(
+        base=w_ptr,
+        shape=[N, K],
+        strides=[K, 1],
+        block_shape=[BLOCK_N, BLOCK_K],
+    )
+    o_desc = tl.make_tensor_descriptor(
+        base=o_ptr,
+        shape=[M, N],
+        strides=[N, 1],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    scales_desc = tl.make_tensor_descriptor(
+        base=scales_ptr,
+        shape=[N],
+        strides=[1],
+        block_shape=[BLOCK_N],
+    )
+
+    # Compute C.T tile: C.T = scale.T * (W @ X.T).
+    tile_n = tl.program_id(0) * BLOCK_N
+    tile_m = tl.program_id(1) * BLOCK_M
+
+    c_t_tile = tl.zeros([BLOCK_N, BLOCK_M], dtype=tl.int32)
+
+    for k in range(0, K, BLOCK_K):
+        w_tile = w_desc.load([tile_n, k])  # (BLOCK_N, BLOCK_K) in int8
+        x_tile = x_desc.load([tile_m, k])  # (BLOCK_M, BLOCK_K) in int8
+
+        # Matrix multiply with swapped A/B: w @ x.T
+        c_t_tile += tl.dot(w_tile, tl.trans(x_tile)).to(tl.int32)
+
+    # Dequantize C.T to fp32. Scales are per output channel (N).
+    scales = scales_desc.load([tile_n])
+    c_t_tile = c_t_tile.to(tl.float32) * scales[:, None]
+
+    # Store C by transposing the computed C.T tile back into (M, N).
+    o_desc.store([tile_m, tile_n], tl.trans(c_t_tile))
+
+
 def per_channel_quant_gemm(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -93,6 +153,44 @@ def per_channel_quant_gemm(
 
     scales = x_scale * w_scales
     per_channel_quant_gemm_kernel[grid](
+        x,
+        w,
+        o,
+        scales,
+        M,
+        N,
+        K,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+    )
+    return o
+
+
+def per_channel_quant_gemm_swapAB(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    o: torch.Tensor,
+    w_scales: torch.Tensor,
+    x_scale: torch.Tensor,
+) -> torch.Tensor:
+
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 32
+
+    M, K = x.shape
+    N, K_w = w.shape
+    assert K == K_w, "Input shapes must align for matrix multiplication"
+    assert w_scales.shape == (N,), "Weight scales must have shape (N,)"
+
+    grid = (
+        triton.cdiv(N, BLOCK_N),
+        triton.cdiv(M, BLOCK_M),
+    )
+
+    scales = x_scale * w_scales
+    per_channel_quant_gemm_swapAB_kernel[grid](
         x,
         w,
         o,
@@ -136,6 +234,7 @@ def main():
 
     funcs_to_bench = {
         "per_channel_quant_gemm": per_channel_quant_gemm,
+        "per_channel_quant_gemm_swapAB": per_channel_quant_gemm_swapAB,
     }
 
     mem_access_bytes = (
